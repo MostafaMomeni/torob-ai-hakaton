@@ -1,6 +1,6 @@
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
 from orchestrator import Orchestrator
@@ -9,7 +9,6 @@ from conversation_state import ConversationState
 
 app = FastAPI(title="Shopping Assistant API")
 
-# allow local testing from browsers/tools
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,81 +17,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# instantiate repository and orchestrator (lazy-loading inside orchestrator)
 repo = DataRepository()
 orch = Orchestrator(repo=repo)
 
-# --- API models ---
+
 class QueryRequest(BaseModel):
-    text: str
+    text: str = ""
     conversation_id: Optional[str] = None
-    # Optional user geolocation. When set, used as the search origin for
-    # distance ranking / radius filtering (overrides text-only location when both exist).
     lat: Optional[float] = None
     lon: Optional[float] = None
+    page: Optional[int] = Field(default=1, ge=1)
+    page_size: Optional[int] = Field(default=10, ge=1, le=50)
+    result_id: Optional[str] = None
+
+
+class PaginationMeta(BaseModel):
+    page: int = 1
+    page_size: int = 10
+    total: int = 0
+    total_pages: int = 0
+    has_next: bool = False
+    has_prev: bool = False
+
 
 class QueryResponse(BaseModel):
-    """Fixed response schema returned by every /v1/query call.
+    """Minimal client-facing search response."""
+    status: str  # success | partial | error
+    products: List[Dict[str, Any]] = []
+    pagination: PaginationMeta = Field(default_factory=PaginationMeta)
+    result_id: Optional[str] = None
+    expires_at: Optional[str] = None
 
-    products[] item shape:
-      product_id, persian_title, brand_name, model, nearest_shop_distance_km,
-      offers: [{ offer_id, price_toman, warranty, shop_id, distance_km,
-                 shop: { shop_id, name, address, location_label, lat, lon, phones, distance_km } }]
-    """
-    response_type: str  # search_result | empty | clarification | error
-    status: str         # success | partial | error
-    text: str
-    products: List[Dict[str, Any]]
-    applied_filters: Dict[str, Any] = {}
-    unknowns: List[str] = []
-    next_question: Optional[str] = None
-    conversation_id: Optional[str] = None
-    saved_state_snapshot: Dict[str, Any] = {}
 
-# --- Endpoints ---
 @app.on_event("startup")
 def startup_event():
-    # do not load data until first request but ensure files exist by trying to access the data dir
-    try:
-        # repository will lazily load when orchestrator._ensure_loaded() is called
-        pass
-    except Exception:
-        pass
+    pass
 
 
 @app.post("/v1/query", response_model=QueryResponse)
 def query_endpoint(req: QueryRequest):
-    """Run a conversational query (text). Provide an optional conversation_id to continue a session.
-
-    The API returns the orchestrator structured response and saves the conversation state on disk.
-    """
-    # load state if provided
     state = None
     if req.conversation_id:
         try:
             state = orch.load_state(req.conversation_id)
         except Exception:
-            # if loading fails, continue with fresh state
             state = None
-    # call orchestrator; forward optional user coordinates for location-aware search
     try:
-        out = orch.handle_request(req.text, state, lat=req.lat, lon=req.lon)
+        out = orch.handle_request(
+            req.text or "",
+            state,
+            lat=req.lat,
+            lon=req.lon,
+            page=req.page or 1,
+            page_size=req.page_size or 10,
+            result_id=req.result_id,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return out
 
 
+@app.get("/v1/results/{result_id}", response_model=QueryResponse)
+def get_paginated_results(
+    result_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=50),
+):
+    try:
+        out = orch.paginate_results(result_id=result_id, page=page, page_size=page_size)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if out is None:
+        raise HTTPException(
+            status_code=404,
+            detail="result_id not found or expired; please run a new search",
+        )
+    return out
+
+
 @app.get("/v1/product/{product_id}")
 def get_product(product_id: str):
-    """Return a product and its offers."""
     orch._ensure_loaded()
     p = repo.get_product(product_id)
     if not p:
         raise HTTPException(status_code=404, detail="product not found")
     offers = repo.get_offers_by_product(product_id)
     return {
-        "product": p.dict() if hasattr(p, 'dict') else p.__dict__,
-        "offers": [o.dict() if hasattr(o, 'dict') else o.__dict__ for o in offers]
+        "product": p.dict() if hasattr(p, "dict") else p.__dict__,
+        "offers": [o.dict() if hasattr(o, "dict") else o.__dict__ for o in offers],
     }
 
 
@@ -103,18 +115,48 @@ def get_shop(shop_id: str):
     if not s:
         raise HTTPException(status_code=404, detail="shop not found")
     offers = repo.get_offers_by_shop(shop_id)
-    return {"shop": s.dict() if hasattr(s, 'dict') else s.__dict__, "offers": [o.dict() if hasattr(o, 'dict') else o.__dict__ for o in offers]}
+    return {
+        "shop": s.dict() if hasattr(s, "dict") else s.__dict__,
+        "offers": [o.dict() if hasattr(o, "dict") else o.__dict__ for o in offers],
+    }
 
 
 @app.get("/v1/offers")
-def list_offers(product_id: Optional[str] = None, shop_id: Optional[str] = None, limit: Optional[int] = 100):
+def list_offers(
+    product_id: Optional[str] = None,
+    shop_id: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    limit: Optional[int] = None,
+):
     orch._ensure_loaded()
     offers = list(repo._offers.values())
     if product_id:
         offers = [o for o in offers if o.product_id == product_id]
     if shop_id:
         offers = [o for o in offers if o.shop_id == shop_id]
-    return {"count": len(offers[:limit]), "offers": [o.dict() if hasattr(o, 'dict') else o.__dict__ for o in offers[:limit]]}
+    total = len(offers)
+    effective_size = page_size
+    if limit is not None and page_size == 20:
+        effective_size = max(1, min(int(limit), 100))
+    offset = (page - 1) * effective_size
+    page_items = offers[offset: offset + effective_size]
+    total_pages = (total + effective_size - 1) // effective_size if effective_size else 0
+    return {
+        "status": "success",
+        "products": [],
+        "pagination": {
+            "page": page,
+            "page_size": effective_size,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1,
+        },
+        "offers": [o.dict() if hasattr(o, "dict") else o.__dict__ for o in page_items],
+        "result_id": None,
+        "expires_at": None,
+    }
 
 
 @app.get("/v1/state/{conversation_id}")
@@ -127,7 +169,6 @@ def load_state(conversation_id: str):
 
 @app.post("/v1/state")
 def save_state(state_snapshot: Dict[str, Any]):
-    # accept a conversation state snapshot (as produced by saved_state_snapshot)
     try:
         state = ConversationState(**state_snapshot)
     except Exception as e:
@@ -136,6 +177,6 @@ def save_state(state_snapshot: Dict[str, Any]):
     return {"saved": True, "conversation_id": state.conversation_id}
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

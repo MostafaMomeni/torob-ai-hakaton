@@ -468,7 +468,13 @@ def _compact_product(product_id, persian_title, brand_name, model, offers, neare
     }
 
 
-def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int = 50) -> List[Dict[str, Any]]:
+def run_structured_search(
+    repo: DataRepository,
+    spec: Dict[str, Any],
+    limit: int = 50,
+    offset: int = 0,
+    return_total: bool = False,
+):
     """AND search pipeline — every active condition must hold.
 
     Conditions (when provided):
@@ -485,6 +491,11 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
     dropped. Empty list means nothing satisfied all conditions.
 
     Output shape is always the same for every product/offer/shop.
+
+    Pagination:
+      - ``offset`` / ``limit`` slice the ranked list after full ranking.
+      - If ``return_total=True``, returns ``(page_results, total_matched)``
+        so callers can build pagination metadata without a second pass.
     """
     spec = _plain(spec)
     product = _plain(spec.get("product", {}))
@@ -677,8 +688,18 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
         ranked.append((key, candidate, offers, nearest_distance))
 
     ranked.sort(key=lambda x: x[0])
+    total_matched = len(ranked)
+    try:
+        off = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        off = 0
+    try:
+        lim = max(1, int(limit))
+    except (TypeError, ValueError):
+        lim = 50
+    page_slice = ranked[off: off + lim]
     results = []
-    for _, candidate, offers, nearest_distance in ranked[:max(1, int(limit))]:
+    for _, candidate, offers, nearest_distance in page_slice:
         results.append(_compact_product(
             product_id=candidate["product_id"],
             persian_title=candidate.get("persian_title"),
@@ -687,4 +708,6 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
             offers=offers,
             nearest_distance=nearest_distance,
         ))
+    if return_total:
+        return results, total_matched
     return results

@@ -63,6 +63,10 @@ class OfferFiltersSpec(BaseModel):
 class SearchOptionsSpec(BaseModel):
     sort_by: Optional[str] = 'relevance'
     limit: int = 10
+    page: int = 1
+    page_size: int = 10
+    # Max items retained in conversation cache for subsequent page requests (no LLM).
+    max_cached_results: int = 100
     include_alternatives: bool = True
     semantic_search: bool = True
 

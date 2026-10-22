@@ -35,9 +35,15 @@ logger.propagate = False
 STATES_DIR = DATA_DIR / "states"
 STATES_DIR.mkdir(exist_ok=True)
 
+RESULT_CACHE_DIR = DATA_DIR / "result_cache"
+RESULT_CACHE_DIR.mkdir(exist_ok=True)
+
 
 class Orchestrator:
     def __init__(self, repo: Optional[DataRepository] = None):
+        from result_cache import ResultCache
+
+        self.result_cache = ResultCache(RESULT_CACHE_DIR)
         # If repo is None, use a lightweight in-memory stub to avoid loading large CSVs
         if repo is None:
 
@@ -508,6 +514,265 @@ class Orchestrator:
             data = json.load(f)
         return ConversationState(**data)
 
+    # ---------- Pagination helpers (no LLM) ----------
+    MAX_CACHED_RESULTS = 100
+
+    @staticmethod
+    def _pagination_meta(page: int, page_size: int, total: int) -> Dict[str, Any]:
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 10), 50))
+        total = max(0, int(total or 0))
+        total_pages = (total + page_size - 1) // page_size if page_size and total else 0
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1 and total > 0,
+        }
+
+    @staticmethod
+    def _is_pagination_only_request(text: str, page: int, has_cached: bool) -> bool:
+        """True when the client is only asking for another page of existing results.
+
+        Used so we can skip the LLM entirely.
+        """
+        if not has_cached:
+            return False
+        t = (text or "").strip()
+        if not t:
+            # Explicit page param (or page>1) with empty text → pure pagination.
+            return True
+        # Common Persian / English page phrases — no product search intent.
+        import re as _re
+        patterns = [
+            r"^صفحه\s*(ی\s*)?(بعد(ی)?|قبلی|\d+)$",
+            r"^(صفحه\s*)?\d+\s*$",
+            r"^(next|prev|previous|page\s*\d+)\s*$",
+            r"^(بیشتر|نتایج\s*بیشتر|more)$",
+        ]
+        for p in patterns:
+            if _re.match(p, t, flags=_re.IGNORECASE):
+                return True
+        # If client sent page>1 and text is very short / only digits, treat as pagination.
+        if page > 1 and len(t) <= 12 and _re.fullmatch(r"[\d\sصفحهبعدیقبلیpage]+", t, flags=_re.IGNORECASE):
+            return True
+        return False
+
+    def _hydrate_products_from_ids(self, product_ids: List[str]) -> List[Dict[str, Any]]:
+        """Rebuild compact product+offers payloads from cached ordered ids (no search)."""
+        self._ensure_loaded()
+        out: List[Dict[str, Any]] = []
+        for pid in product_ids:
+            p = self.repo.get_product(pid)
+            if not p:
+                continue
+            out.append(self._product_with_offers(p))
+        return out
+
+    def _normalize_products(self, response_products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Minimal product payload for the API client."""
+        from product_search import _compact_shop, _shop_details
+        normalized_products = []
+        for p in response_products or []:
+            if not isinstance(p, dict):
+                continue
+            offers_out = []
+            for o in p.get("offers") or []:
+                if not isinstance(o, dict):
+                    continue
+                shop_in = o.get("shop") if isinstance(o.get("shop"), dict) else {}
+                if not shop_in and o.get("shop_id"):
+                    shop_in = _compact_shop(
+                        _shop_details(self.repo, o.get("shop_id")), o.get("distance_km")
+                    )
+                offers_out.append({
+                    "offer_id": o.get("offer_id"),
+                    "price_toman": o.get("price_toman"),
+                    "warranty": o.get("warranty") or o.get("warranty_recorded"),
+                    "distance_km": o.get("distance_km") or shop_in.get("distance_km"),
+                    "shop": {
+                        "shop_id": shop_in.get("shop_id") or o.get("shop_id"),
+                        "name": shop_in.get("name"),
+                        "address": shop_in.get("address") or shop_in.get("location_label"),
+                        "phones": shop_in.get("phones") or [],
+                    },
+                })
+            normalized_products.append({
+                "product_id": p.get("product_id"),
+                "persian_title": p.get("persian_title"),
+                "brand_name": p.get("brand_name"),
+                "model": p.get("model"),
+                "nearest_shop_distance_km": p.get("nearest_shop_distance_km"),
+                "offers": offers_out,
+            })
+        return normalized_products
+
+    @staticmethod
+    def _api_response(
+        *,
+        status: str,
+        products: Optional[List[Dict[str, Any]]] = None,
+        pagination: Optional[Dict[str, Any]] = None,
+        result_id: Optional[str] = None,
+        expires_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Strict minimal response shape for /v1/query and /v1/results."""
+        return {
+            "status": status,
+            "products": products or [],
+            "pagination": pagination or {
+                "page": 1,
+                "page_size": 10,
+                "total": 0,
+                "total_pages": 0,
+                "has_next": False,
+                "has_prev": False,
+            },
+            "result_id": result_id,
+            "expires_at": expires_at,
+        }
+
+    def _build_page_text(self, products: List[Dict[str, Any]], page: int, total: int, page_size: int) -> str:
+        if not products:
+            return "نتیجه‌ای برای این صفحه وجود ندارد."
+        lines = []
+        for p in products[: min(5, len(products))]:
+            title = p.get("persian_title") or p.get("product_id") or ""
+            brand = p.get("brand_name")
+            brand_part = f" | برند: {brand}" if brand else ""
+            offers = p.get("offers") or []
+            priced = [o for o in offers if o.get("price_toman") is not None]
+            if priced:
+                cheapest = min(priced, key=lambda x: x["price_toman"])
+                shop = cheapest.get("shop") or {}
+                shop_name = shop.get("name") or ""
+                address = shop.get("address") or shop.get("location_label") or ""
+                distance = cheapest.get("distance_km")
+                parts = [
+                    f"{title}{brand_part}",
+                    f"قیمت: {cheapest['price_toman']:,} تومان".replace(",", "٬"),
+                ]
+                if shop_name:
+                    parts.append(f"فروشگاه: {shop_name}")
+                if address:
+                    parts.append(f"آدرس: {address}")
+                if distance is not None:
+                    parts.append(f"فاصله: {distance} کیلومتر")
+                lines.append(" — ".join(parts))
+            else:
+                lines.append(f"{title}{brand_part} — قیمت در دسترس نیست")
+        total_pages = (total + page_size - 1) // page_size if page_size and total else 0
+        header = f"صفحه {page} از {total_pages} (مجموع {total} نتیجه):\n"
+        return header + "\n".join(lines)
+
+    def paginate_results(
+        self,
+        result_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> Optional[Dict[str, Any]]:
+        """Serve a page from result_id cache (preferred) or conversation state — never calls LLM.
+
+        Returns None if neither cache has usable data.
+        """
+        # 1) Primary: result_id cache (30-min TTL)
+        if result_id:
+            entry = self.result_cache.get(result_id)
+            if entry:
+                return self._serve_from_result_entry(entry, page=page, page_size=page_size)
+            # invalid / expired
+            return None
+
+        # 2) Fallback: conversation state last_result_ids
+        if conversation_id:
+            state = self.load_state(conversation_id)
+            if state and state.last_result_ids:
+                return self._serve_cached_page(state, page=page, page_size=page_size)
+        return None
+
+    def _serve_from_result_entry(
+        self,
+        entry: Dict[str, Any],
+        page: int = 1,
+        page_size: int = 10,
+        state: Optional[ConversationState] = None,
+    ) -> Dict[str, Any]:
+        """Build a page response from a ResultCache entry — no LLM."""
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 10), 50))
+        ids = list(entry.get("product_ids") or [])
+        total = int(entry.get("total") or len(ids))
+        offset = (page - 1) * page_size
+        page_ids = ids[offset: offset + page_size]
+        raw_products = self._hydrate_products_from_ids(page_ids)
+        normalized = self._normalize_products(raw_products)
+        meta = self._pagination_meta(page, page_size, total)
+
+        conv_id = entry.get("conversation_id")
+        if state is None and conv_id:
+            try:
+                state = self.load_state(conv_id)
+            except Exception:
+                state = None
+        if state is not None:
+            state.last_result_ids = ids
+            state.last_result_total = total
+            state.last_page = page
+            state.last_page_size = page_size
+            state.previous_results["products"] = normalized
+            state.previous_results["pagination"] = meta
+            state.previous_results["result_id"] = entry.get("result_id")
+            state.last_updated = datetime.utcnow()
+            try:
+                self.save_state(state)
+            except Exception:
+                logger.warning("save_state failed during result_id pagination")
+
+        return self._api_response(
+            status="success" if normalized else "partial",
+            products=normalized,
+            pagination=meta,
+            result_id=entry.get("result_id"),
+            expires_at=entry.get("expires_at"),
+        )
+
+    def _serve_cached_page(
+        self,
+        state: ConversationState,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> Dict[str, Any]:
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 10), 50))
+        ids = list(state.last_result_ids or [])
+        total = state.last_result_total or len(ids)
+        offset = (page - 1) * page_size
+        page_ids = ids[offset: offset + page_size]
+        raw_products = self._hydrate_products_from_ids(page_ids)
+        normalized = self._normalize_products(raw_products)
+        meta = self._pagination_meta(page, page_size, total)
+
+        state.last_page = page
+        state.last_page_size = page_size
+        state.previous_results["products"] = normalized
+        state.previous_results["pagination"] = meta
+        state.last_updated = datetime.utcnow()
+        try:
+            self.save_state(state)
+        except Exception:
+            logger.warning("save_state failed during pagination; continuing")
+
+        return self._api_response(
+            status="success" if normalized else "partial",
+            products=normalized,
+            pagination=meta,
+            result_id=state.previous_results.get("result_id"),
+            expires_at=state.previous_results.get("expires_at"),
+        )
+
     # ---------- Main handler ----------
     def handle_request(
         self,
@@ -515,12 +780,59 @@ class Orchestrator:
         state: Optional[ConversationState] = None,
         lat: Optional[float] = None,
         lon: Optional[float] = None,
+        page: int = 1,
+        page_size: int = 10,
+        result_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._ensure_loaded()
         if state is None:
             state = ConversationState(
                 conversation_id=f"conv_{int(datetime.utcnow().timestamp())}"
             )
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 10), 50))
+        text = text or ""
+
+        # --- Primary path: valid result_id → serve page, never call LLM ---
+        if result_id:
+            entry = self.result_cache.get(result_id)
+            if entry:
+                # If client also sent new search text, prefer re-search (ignore stale result_id).
+                if text.strip() and not self._is_pagination_only_request(text, page, True):
+                    logger.info(
+                        "result_id=%s present but new search text provided — running full search",
+                        result_id,
+                    )
+                else:
+                    logger.info(
+                        "Serving page from result_id=%s (page=%s) — skipping LLM",
+                        result_id,
+                        page,
+                    )
+                    return self._serve_from_result_entry(
+                        entry, page=page, page_size=page_size, state=state
+                    )
+            else:
+                # Expired or unknown result_id
+                if not text.strip():
+                    return self._api_response(
+                        status="error",
+                        products=[],
+                        pagination=self._pagination_meta(page, page_size, 0),
+                        result_id=None,
+                        expires_at=None,
+                    )
+                # has text → fall through to full LLM search
+
+        # --- Legacy fallback: conversation-state pagination (no result_id) ---
+        has_cached = bool(state.last_result_ids)
+        if not result_id and self._is_pagination_only_request(text, page, has_cached):
+            logger.info(
+                "Pagination-only request via conversation state (page=%s) — skipping LLM",
+                page,
+            )
+            return self._serve_cached_page(state, page=page, page_size=page_size)
+
         state.original_request = state.original_request or text
         state.last_updated = datetime.utcnow()
 
@@ -784,13 +1096,24 @@ class Orchestrator:
                         # A valid structured search owns both retrieval and hard filters.
                         # If it returns zero results, do not fall back to a price-only
                         # search that can return unrelated products.
-                        ss_results = run_structured_search(
+                        # Fetch up to MAX_CACHED_RESULTS so later pages can be
+                        # served from state without calling the LLM again.
+                        cache_limit = self.MAX_CACHED_RESULTS
+                        ss_results, total_matched = run_structured_search(
                             self.repo,
                             spec_dict,
-                            limit=state.active_filters.get("limit", 20) or 20,
+                            limit=cache_limit,
+                            offset=0,
+                            return_total=True,
                         )
                         structured_search_attempted = True
                         response_products = ss_results
+                        state.last_result_ids = [p["product_id"] for p in ss_results if p.get("product_id")]
+                        state.last_result_total = total_matched
+                        state.last_search_snapshot = {
+                            "spec": spec_dict,
+                            "ts": datetime.utcnow().isoformat(),
+                        }
                         if ss_results:
                             reasons["note"] = "نتایج بر اساس نام محصول و فیلترهای ساختاریافته بازگشتی."
                         else:
@@ -828,17 +1151,28 @@ class Orchestrator:
                     price_dict.setdefault("max", entities["budget_toman"])
                 if product_name or loc_dict:
                     from product_search import run_structured_search
-                    ss_results = run_structured_search(
+                    cache_limit = self.MAX_CACHED_RESULTS
+                    ss_results, total_matched = run_structured_search(
                         self.repo,
                         {
                             "product": {"name": product_name},
                             "price": price_dict,
                             "location": loc_dict,
                         },
-                        limit=state.active_filters.get("limit", 20) or 20,
+                        limit=cache_limit,
+                        offset=0,
+                        return_total=True,
                     )
                     structured_search_attempted = True
                     response_products = ss_results
+                    state.last_result_ids = [p["product_id"] for p in ss_results if p.get("product_id")]
+                    state.last_result_total = total_matched
+                    state.last_search_snapshot = {
+                        "product_name": product_name,
+                        "price": price_dict,
+                        "location": loc_dict,
+                        "ts": datetime.utcnow().isoformat(),
+                    }
                     if ss_results:
                         reasons["note"] = "نتایج بر اساس نام محصول و فیلترهای ساختاریافته بازگشتی."
                     else:
@@ -899,7 +1233,8 @@ class Orchestrator:
                 if entities.get("budget_toman") is not None:
                     price_dict.setdefault("max", entities["budget_toman"])
 
-                ss_results = run_structured_search(
+                cache_limit = self.MAX_CACHED_RESULTS
+                ss_results, total_matched = run_structured_search(
                     self.repo,
                     {
                         "product": {
@@ -909,10 +1244,21 @@ class Orchestrator:
                         "price": price_dict,
                         "location": loc_dict,
                     },
-                    limit=state.active_filters.get("limit", 20) or 20,
+                    limit=cache_limit,
+                    offset=0,
+                    return_total=True,
                 )
                 structured_search_attempted = True
                 response_products = ss_results
+                state.last_result_ids = [p["product_id"] for p in ss_results if p.get("product_id")]
+                state.last_result_total = total_matched
+                state.last_search_snapshot = {
+                    "product_name": product_name,
+                    "brand": brand,
+                    "price": price_dict,
+                    "location": loc_dict,
+                    "ts": datetime.utcnow().isoformat(),
+                }
                 if ss_results:
                     reasons["note"] = "نتایج بر اساس نام محصول و فیلترهای ساختاریافته."
                 else:
@@ -920,19 +1266,11 @@ class Orchestrator:
             except Exception as e:
                 status = "error"
                 logger.warning("fallback structured_search failed: %s", e)
-                return {
-                    "response_type": "error",
-                    "status": "error",
-                    "text": "هنگام پردازش درخواست خطا رخ داد: " + str(e),
-                    "products": [],
-                    "stores": [],
-                    "reasons": {},
-                    "applied_filters": {},
-                    "unknowns": missing,
-                    "next_question": None,
-                    "conversation_id": state.conversation_id,
-                    "saved_state_snapshot": state.snapshot(),
-                }
+                return self._api_response(
+                    status="error",
+                    products=[],
+                    pagination=self._pagination_meta(page, page_size, 0),
+                )
 
         # post-check: are results sufficient?
         sufficient = True
@@ -944,100 +1282,14 @@ class Orchestrator:
                 next_q = "لطفا بگویید دنبال چه محصولی هستید یا بودجه و برند مورد نظر را بنویسید."
                 missing.append("product_keyword")
 
-        # update state
-        state.previous_results["products"] = response_products
-        if len(response_products) == 1:
-            state.selected_product_ids = [response_products[0]["product_id"]]
-        state.last_updated = datetime.utcnow()
-        try:
-            self.save_state(state)
-        except Exception:
-            logger.warning("save_state failed; continuing without persistence")
+        # Ensure last_result_ids is populated even if search path set it partially.
+        if response_products and not state.last_result_ids:
+            state.last_result_ids = [
+                p["product_id"] for p in response_products if isinstance(p, dict) and p.get("product_id")
+            ]
+            state.last_result_total = len(state.last_result_ids)
 
-        # build Persian text summary (compact, includes brand + shop address)
-        if status == "error":
-            text = "متأسفم، مشکلی پیش آمد."
-        elif not response_products:
-            text = "نتیجه‌ای پیدا نشد."
-        else:
-            lines = []
-            for p in response_products[:5]:
-                title = p.get("persian_title") or p.get("product_id") or ""
-                brand = p.get("brand_name")
-                brand_part = f" | برند: {brand}" if brand else ""
-                offers = p.get("offers") or []
-                priced = [o for o in offers if o.get("price_toman") is not None]
-                if priced:
-                    cheapest = min(priced, key=lambda x: x["price_toman"])
-                    shop = cheapest.get("shop") or {}
-                    shop_name = shop.get("name") or ""
-                    address = shop.get("address") or shop.get("location_label") or ""
-                    distance = cheapest.get("distance_km")
-                    parts = [
-                        f"{title}{brand_part}",
-                        f"قیمت: {cheapest['price_toman']:,} تومان".replace(",", "٬"),
-                    ]
-                    if shop_name:
-                        parts.append(f"فروشگاه: {shop_name}")
-                    if address:
-                        parts.append(f"آدرس: {address}")
-                    if distance is not None:
-                        parts.append(f"فاصله: {distance} کیلومتر")
-                    lines.append(" — ".join(parts))
-                else:
-                    lines.append(f"{title}{brand_part} — قیمت در دسترس نیست")
-            text = "پیشنهادها:\n" + "\n".join(lines)
-            if next_q:
-                text += "\n\n" + next_q
-
-        # Normalize every product/offer to the fixed response shape.
-        from product_search import _compact_product, _compact_offer, _compact_shop, _shop_details
-        normalized_products = []
-        for p in response_products or []:
-            if not isinstance(p, dict):
-                continue
-            offers_in = p.get("offers") or []
-            offers_out = []
-            for o in offers_in:
-                if not isinstance(o, dict):
-                    continue
-                shop = o.get("shop") if isinstance(o.get("shop"), dict) else {}
-                if not shop and o.get("shop_id"):
-                    shop = _compact_shop(_shop_details(self.repo, o.get("shop_id")), o.get("distance_km"))
-                else:
-                    shop = {
-                        "shop_id": shop.get("shop_id"),
-                        "name": shop.get("name"),
-                        "address": shop.get("address"),
-                        "location_label": shop.get("location_label"),
-                        "lat": shop.get("lat"),
-                        "lon": shop.get("lon"),
-                        "phones": shop.get("phones") or [],
-                        "category_names": shop.get("category_names"),
-                        "instagram": shop.get("instagram"),
-                        "website_url": shop.get("website_url"),
-                        "payment_options": shop.get("payment_options"),
-                        "supports_fast_delivery": shop.get("supports_fast_delivery"),
-                        "weekly_hours": shop.get("weekly_hours"),
-                        "distance_km": shop.get("distance_km", o.get("distance_km")),
-                    }
-                offers_out.append({
-                    "offer_id": o.get("offer_id"),
-                    "price_toman": o.get("price_toman"),
-                    "warranty": o.get("warranty") or o.get("warranty_recorded"),
-                    "shop_id": o.get("shop_id") or shop.get("shop_id"),
-                    "distance_km": o.get("distance_km", shop.get("distance_km")),
-                    "shop": shop,
-                })
-            normalized_products.append({
-                "product_id": p.get("product_id"),
-                "persian_title": p.get("persian_title"),
-                "brand_name": p.get("brand_name"),
-                "model": p.get("model"),
-                "nearest_shop_distance_km": p.get("nearest_shop_distance_km"),
-                "sort_score": p.get("sort_score", 0.0),
-                "offers": offers_out,
-            })
+        total_for_page = state.last_result_total or len(state.last_result_ids or response_products or [])
 
         applied_filters = {
             "product_name": entities.get("product_name") or entities.get("query"),
@@ -1048,25 +1300,77 @@ class Orchestrator:
             "lat": entities.get("latitude"),
             "lon": entities.get("longitude"),
         }
-        # drop null-only noise keys but keep the fixed key set
         applied_filters = {k: (v if v is not None else None) for k, v in applied_filters.items()}
 
-        out = {
-            "response_type": (
-                "search_result"
-                if normalized_products
-                else ("clarification" if missing else "empty")
-            ),
-            "status": status,
-            "text": text,
-            "products": normalized_products,
-            "applied_filters": applied_filters,
-            "unknowns": missing or [],
-            "next_question": next_q,
-            "conversation_id": state.conversation_id,
-            "saved_state_snapshot": state.snapshot(),
-        }
-        return out
+        # --- Persist ranked set under a new result_id (30-min TTL) ---
+        cache_entry = None
+        if state.last_result_ids:
+            try:
+                cache_entry = self.result_cache.put(
+                    state.last_result_ids,
+                    total=total_for_page,
+                    applied_filters=applied_filters,
+                    search_snapshot=dict(state.last_search_snapshot or {}),
+                    conversation_id=state.conversation_id,
+                    query_text=text,
+                )
+                state.previous_results["result_id"] = cache_entry["result_id"]
+                state.previous_results["expires_at"] = cache_entry["expires_at"]
+            except Exception as e:
+                logger.warning("result_cache.put failed: %s", e)
+                cache_entry = None
+
+        # Slice the current page out of the cached / fetched ordered list.
+        offset = (page - 1) * page_size
+        if state.last_result_ids:
+            page_ids = state.last_result_ids[offset: offset + page_size]
+            id_to_prod = {
+                p["product_id"]: p
+                for p in (response_products or [])
+                if isinstance(p, dict) and p.get("product_id")
+            }
+            page_products = []
+            missing_ids = []
+            for pid in page_ids:
+                if pid in id_to_prod:
+                    page_products.append(id_to_prod[pid])
+                else:
+                    missing_ids.append(pid)
+            if missing_ids:
+                page_products.extend(self._hydrate_products_from_ids(missing_ids))
+                by_id = {p["product_id"]: p for p in page_products if p.get("product_id")}
+                page_products = [by_id[pid] for pid in page_ids if pid in by_id]
+        else:
+            page_products = (response_products or [])[offset: offset + page_size]
+
+        state.last_page = page
+        state.last_page_size = page_size
+        state.previous_results["products"] = page_products
+        state.previous_results["pagination"] = self._pagination_meta(page, page_size, total_for_page)
+        if len(page_products) == 1:
+            state.selected_product_ids = [page_products[0]["product_id"]]
+        state.last_updated = datetime.utcnow()
+        try:
+            self.save_state(state)
+        except Exception:
+            logger.warning("save_state failed; continuing without persistence")
+
+        pagination = self._pagination_meta(page, page_size, total_for_page)
+        normalized_products = self._normalize_products(page_products)
+        if status == "error":
+            final_status = "error"
+        elif not normalized_products:
+            final_status = "partial"
+        else:
+            final_status = "success"
+
+        return self._api_response(
+            status=final_status,
+            products=normalized_products,
+            pagination=pagination,
+            result_id=cache_entry["result_id"] if cache_entry else None,
+            expires_at=cache_entry["expires_at"] if cache_entry else None,
+        )
 
 
 if __name__ == "__main__":

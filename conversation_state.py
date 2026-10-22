@@ -25,6 +25,16 @@ class ConversationState(BaseModel):
     # conversation messages (keeps recent user/assistant turns for local context; not sent fully to LLM)
     messages: List[Dict[str, Any]] = Field(default_factory=list)
 
+    # --- Pagination cache (ordered result set for the last search) ---
+    # Full ordered product_ids from the last search (up to MAX_CACHED_RESULTS).
+    # Serving page 2+ uses only this list + repo hydration — no LLM call.
+    last_result_ids: List[str] = Field(default_factory=list)
+    last_result_total: int = 0
+    last_page: int = 1
+    last_page_size: int = 10
+    # Snapshot of the SearchSpec / filters used to produce last_result_ids
+    last_search_snapshot: Dict[str, Any] = Field(default_factory=dict)
+
     def snapshot(self):
         return self.dict()
 
@@ -66,5 +76,7 @@ class ConversationState(BaseModel):
             'previous_results_summary': prev,
             'recent_user_messages': recent_user_texts,
             'missing_information': self.missing_information,
+            'last_result_total': self.last_result_total,
+            'last_page': self.last_page,
+            'last_page_size': self.last_page_size,
         }
-

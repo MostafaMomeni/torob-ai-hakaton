@@ -354,17 +354,9 @@ class LLMAdapter:
             if first_msg:
                 req_summary["first_input_snippet"] = _snip(first_msg, 300)
             logger.debug("LLM request summary: %s", req_summary)
-            # Also print a clear console-visible summary so the user sees the LLM input
-            try:
-                print("LLM_IN_SUMMARY:", req_summary)
-                if show_full:
-                    # sanitized full payload (do not include headers or API key)
-                    full_payload = {k: v for k, v in payload.items()}
-                    logger.debug("LLM full request payload (sanitized): %s", full_payload)
-                    print("LLM_IN_FULL_PAYLOAD:", full_payload)
-            except Exception:
-                # Printing should never break the request flow
-                logger.exception("Failed to print LLM input summary")
+            if show_full:
+                full_payload = {k: v for k, v in payload.items()}
+                logger.debug("LLM full request payload (sanitized): %s", full_payload)
         except Exception:
             logger.exception("Failed to log LLM request summary")
 
@@ -385,12 +377,6 @@ class LLMAdapter:
         try:
             resp_snip = _snip(response.text, 1500)
             logger.debug("LLM HTTP %s response snippet: %s", response.status_code, resp_snip)
-            # Print a concise response snippet to console for visibility
-            try:
-                print("LLM_HTTP_STATUS:", response.status_code)
-                print("LLM_HTTP_SNIPPET:", _snip(response.text, 1000))
-            except Exception:
-                logger.exception("Failed to print LLM HTTP snippet")
         except Exception:
             logger.exception("Failed to log LLM response snippet")
 
@@ -440,21 +426,10 @@ class LLMAdapter:
         if not isinstance(data, dict):
             raise LLMError("Unexpected LLM response structure.")
 
-        # Extract text and print output summary to console
         try:
             extracted = self._extract_text(data)
-            try:
-                print("LLM_OUT:", _snip(extracted, 2000))
-                if show_full:
-                    # when enabled show raw JSON response (safe to print)
-                    try:
-                        print("LLM_RAW_JSON_RESPONSE:", data)
-                    except Exception:
-                        logger.exception("Failed to print raw LLM JSON response")
-            except Exception:
-                logger.exception("Failed to print LLM output")
+            logger.debug("LLM output snippet: %s", _snip(extracted, 500))
         except Exception:
-            # If extraction failed, re-raise to keep original behavior
             raise
 
         return extracted
