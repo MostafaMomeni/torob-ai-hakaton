@@ -228,35 +228,138 @@ def _flatten(value):
     return str(value)
 
 
-def _shop_text(repo, offer):
-    shop = repo.get_shop(offer.shop_id) if offer.shop_id else None
+def _shop_details(repo, shop_id):
+    getter = getattr(repo, "get_shop_details", None)
+    if callable(getter):
+        details = getter(shop_id)
+        if details:
+            return details
+    shop = repo.get_shop(shop_id) if shop_id else None
     if not shop:
-        return ""
-    return normalize_persian_text(" ".join(str(x or "") for x in
-        (shop.name, shop.address, shop.location_label)))
+        return {}
+    return {key: getattr(shop, key, None) for key in (
+        "shop_id", "name", "address", "category_names", "contacts", "instagram",
+        "lat", "location_label", "lon", "payment_options",
+        "supports_fast_delivery", "website_url", "weekly_hours"
+    )}
+
+
+def _shop_text(repo, offer):
+    details = _shop_details(repo, getattr(offer, "shop_id", None))
+    return normalize_persian_text(" ".join(str(details.get(key) or "") for key in
+        ("name", "address", "location_label", "category_names")))
+
+
+def _coordinates(location):
+    location = _plain(location)
+    lat = location.get("latitude", location.get("lat"))
+    lon = location.get("longitude", location.get("lon", location.get("lng")))
+    try:
+        lat, lon = float(lat), float(lon)
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _shop_coordinates(details):
+    try:
+        lat, lon = float(details.get("lat")), float(details.get("lon"))
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _distance_km(a, b):
+    """Haversine distance between (lat, lon) pairs."""
+    import math
+    lat1, lon1 = a
+    lat2, lon2 = b
+    radius = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    h = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return radius * 2 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def _resolve_text_location(repo, location_text):
+    """Resolve a place name from shop metadata when possible.
+
+    Without a geocoder, use coordinates of shops whose address/location label
+    contains the requested place and calculate their centroid. A caller can
+    pass latitude/longitude to avoid this approximation.
+    """
+    query = normalize_persian_text(location_text)
+    if not query:
+        return None, set()
+    matched_coords, matched_shop_ids = [], set()
+    shops = getattr(repo, "_shops", {}).values()
+    for shop in shops:
+        details = _shop_details(repo, getattr(shop, "shop_id", None))
+        hay = normalize_persian_text(" ".join(str(details.get(k) or "") for k in
+            ("name", "address", "location_label")))
+        if query in hay:
+            coords = _shop_coordinates(details)
+            if coords:
+                matched_coords.append(coords)
+            if details.get("shop_id"):
+                matched_shop_ids.add(str(details["shop_id"]))
+    if not matched_coords:
+        return None, matched_shop_ids
+    return (sum(x[0] for x in matched_coords) / len(matched_coords),
+            sum(x[1] for x in matched_coords) / len(matched_coords)), matched_shop_ids
 
 
 def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int = 50) -> List[Dict[str, Any]]:
-    """Retrieve by name, then apply price/location/features as hard filters and rank."""
+    """Search by product name, apply price and brand filters, then rank by shop proximity."""
     spec = _plain(spec)
     product = _plain(spec.get("product", {}))
     price = _plain(spec.get("price", {}))
     location = _plain(spec.get("location", {}))
     options = _plain(spec.get("search_options", {}))
+
     name = product.get("name") or product.get("product_name") or spec.get("query")
     keywords = product.get("keywords") or spec.get("keywords") or []
     if isinstance(keywords, str):
         keywords = [keywords]
-    brand, model = product.get("brand") or spec.get("brand"), product.get("model") or spec.get("model")
+    brand = product.get("brand") or spec.get("brand")
+    model = product.get("model") or spec.get("model")
+    requested_brand = normalize_persian_text(brand)
+
     ps = ProductSearcher(repo)
-    candidates = ps.retrieve_candidates(name, keywords, brand, model, limit=max(limit*20, 500))
+    # Retrieve based on product identity first. Brand is a hard filter below,
+    # not an alternate query that can introduce unrelated products.
+    candidates = ps.retrieve_candidates(
+        name, keywords, brand=None, model=model, limit=max(limit * 30, 1000)
+    )
 
     min_price = price.get("min", spec.get("min_price"))
     max_price = price.get("max", spec.get("max_price"))
-    loc_value = location.get("city") or location.get("text")
+    loc_value = (
+        location.get("city")
+        or location.get("text")
+        or location.get("address")
+        or location.get("area")
+    )
     if not loc_value and isinstance(spec.get("location"), str):
         loc_value = spec["location"]
-    location_query = normalize_persian_text(loc_value)
+    location_query = normalize_persian_text(loc_value) if loc_value else ""
+    # Prefer explicit lat/lon from the request (API user GPS or LLM coords).
+    target_coords = _coordinates(location)
+    matched_location_shop_ids = set()
+    if target_coords is None and location_query:
+        target_coords, matched_location_shop_ids = _resolve_text_location(repo, loc_value)
+
+    radius_km = location.get("radius_km")
+    try:
+        radius_km = float(radius_km) if radius_km is not None else None
+    except (TypeError, ValueError):
+        radius_km = None
+
     feature_terms = []
     for feature in (product.get("features") or product.get("attributes") or []):
         if isinstance(feature, str):
@@ -267,6 +370,7 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
             value = feature.get("value")
             if value not in (None, True, False):
                 feature_terms.append(normalize_persian_text(value))
+
     sort_by = str(options.get("sort_by") or spec.get("sort_by") or "relevance").lower()
     ranked = []
 
@@ -275,6 +379,21 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
         p = repo.get_product(pid)
         if not p:
             continue
+
+        # Brand is a strict filter against the product's brand field.
+        if requested_brand:
+            actual_brand = normalize_persian_text(getattr(p, "brand_name", "") or "")
+            if requested_brand not in actual_brand:
+                continue
+
+        if feature_terms:
+            searchable = normalize_persian_text(
+                _flatten(getattr(p, "specs", None)) + " " +
+                (getattr(p, "persian_title", "") or "")
+            )
+            if any(term and term not in searchable for term in feature_terms):
+                continue
+
         offers = []
         for offer in repo.get_offers_by_product(pid):
             if offer.price_toman is None:
@@ -283,46 +402,110 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
                 amount = float(offer.price_toman)
             except (ValueError, TypeError):
                 continue
+            # Stage 2: price constraints.
             if min_price is not None and amount < float(min_price):
                 continue
             if max_price is not None and amount > float(max_price):
                 continue
-            if location_query and location_query not in _shop_text(repo, offer):
+
+            # Stage 3: location metadata and distance ranking.
+            details = _shop_details(repo, getattr(offer, "shop_id", None))
+            shop_coords = _shop_coordinates(details)
+            distance_km = _distance_km(target_coords, shop_coords) if target_coords and shop_coords else None
+            if radius_km is not None and distance_km is not None and distance_km > radius_km:
                 continue
-            offers.append({"offer_id": offer.offer_id, "price_toman": offer.price_toman,
+            if radius_km is not None and target_coords and shop_coords is None:
+                continue
+
+            shop_payload = {key: details.get(key) for key in (
+                "shop_id", "name", "address", "category_names", "contacts", "instagram",
+                "lat", "location_label", "lon", "payment_options", "supports_fast_delivery",
+                "website_url", "weekly_hours"
+            ) if details.get(key) is not None}
+            offer_payload = {
+                "offer_id": offer.offer_id,
+                "price_toman": offer.price_toman,
                 "shop_id": offer.shop_id,
+                "shop": shop_payload or None,
+                "distance_km": round(distance_km, 3) if distance_km is not None else None,
                 "last_price_changed_at": offer.last_price_changed_at.isoformat() if offer.last_price_changed_at else None,
-                "warranty_recorded": getattr(offer, "warranty", None)})
-        # If any offer-level constraint was requested, no matching offer means exclude product.
-        if (min_price is not None or max_price is not None or location_query) and not offers:
+                "warranty_recorded": getattr(offer, "warranty", None),
+            }
+            offers.append(offer_payload)
+
+        has_offer_constraints = min_price is not None or max_price is not None or radius_km is not None
+        if has_offer_constraints and not offers:
             continue
-        if feature_terms:
-            searchable = normalize_persian_text(_flatten(getattr(p, "specs", None)) + " " + (p.persian_title or ""))
-            if any(term and term not in searchable for term in feature_terms):
-                continue
+
+        # When the text location could not be geocoded, still prefer offers whose
+        # shop metadata explicitly mentions that place; otherwise preserve results.
+        for offer_payload in offers:
+            if location_query and target_coords is None:
+                details = offer_payload.get("shop") or {}
+                shop_text = normalize_persian_text(" ".join(str(details.get(k) or "") for k in
+                    ("name", "address", "location_label")))
+                offer_payload["location_text_match"] = bool(
+                    location_query in shop_text or str(offer_payload.get("shop_id") or "") in matched_location_shop_ids
+                )
+
         rec = candidate["match_record"]
+        valid_distances = [o["distance_km"] for o in offers if o["distance_km"] is not None]
+        nearest_distance = min(valid_distances) if valid_distances else None
+        location_text_match = any(o.get("location_text_match") for o in offers)
         cheapest = min((float(o["price_toman"]) for o in offers), default=float("inf"))
-        if sort_by in ("price_asc", "price_low_to_high", "cheapest", "price"):
+
+        if target_coords is not None:
+            # Proximity takes precedence when a location was explicitly supplied.
+            key = (nearest_distance if nearest_distance is not None else float("inf"),
+                   rec.tier, -rec.name_relevance_score, cheapest)
+        elif location_query:
+            key = (0 if location_text_match else 1, rec.tier,
+                   -rec.name_relevance_score, cheapest)
+        elif sort_by in ("price_asc", "price_low_to_high", "cheapest", "price"):
             key = (cheapest, rec.tier, -rec.name_relevance_score)
         elif sort_by in ("price_desc", "price_high_to_low", "most_expensive"):
             key = (-cheapest, rec.tier, -rec.name_relevance_score)
         else:
             key = (rec.tier, -rec.name_relevance_score, -ps.token_coverage(rec), cheapest)
-        ranked.append((key, candidate, offers, cheapest))
+
+        # Offers themselves are also sorted by proximity when coordinates exist.
+        if target_coords is not None:
+            offers.sort(key=lambda o: (
+                o["distance_km"] if o["distance_km"] is not None else float("inf"),
+                float(o["price_toman"])
+            ))
+        else:
+            offers.sort(key=lambda o: (
+                0 if o.get("location_text_match") else 1,
+                float(o["price_toman"])
+            ))
+        ranked.append((key, candidate, offers, cheapest, nearest_distance))
 
     ranked.sort(key=lambda x: x[0])
     results = []
-    for rank, (_, candidate, offers, cheapest) in enumerate(ranked[:max(1, int(limit))], 1):
+    for rank, (_, candidate, offers, cheapest, nearest_distance) in enumerate(
+        ranked[:max(1, int(limit))], 1
+    ):
         rec = candidate["match_record"]
         rec.final_rank = rank
-        results.append({"product_id": candidate["product_id"],
-            "persian_title": candidate["persian_title"], "brand_name": candidate.get("brand_name"),
-            "model": candidate.get("model"), "specs": candidate.get("specs"),
-            "offers": sorted(offers, key=lambda o: float(o["price_toman"])),
-            "match_record": {"stages": rec.stages, "matched_phrases": rec.matched_phrases,
+        results.append({
+            "product_id": candidate["product_id"],
+            "persian_title": candidate["persian_title"],
+            "brand_name": candidate.get("brand_name"),
+            "model": candidate.get("model"),
+            "specs": candidate.get("specs"),
+            "nearest_shop_distance_km": round(nearest_distance, 3) if nearest_distance is not None else None,
+            "offers": offers,
+            "match_record": {
+                "stages": rec.stages,
+                "matched_phrases": rec.matched_phrases,
                 "matched_tokens": sorted(rec.matched_tokens),
                 "name_relevance_score": rec.name_relevance_score,
-                "token_match_count": rec.token_match_count, "token_coverage": ps.token_coverage(rec),
-                "tier": rec.tier, "sort_score": round(rec.name_relevance_score + 1000/max(1, rec.tier), 4),
-                "final_rank": rank}})
+                "token_match_count": rec.token_match_count,
+                "token_coverage": ps.token_coverage(rec),
+                "tier": rec.tier,
+                "sort_score": round(rec.name_relevance_score + 1000 / max(1, rec.tier), 4),
+                "final_rank": rank,
+            },
+        })
     return results

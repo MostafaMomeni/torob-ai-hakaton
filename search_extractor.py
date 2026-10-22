@@ -6,7 +6,45 @@ from search_spec import SearchSpec
 
 logger = logging.getLogger('shopping_assistant.search_extractor')
 
-SEARCH_SYSTEM = '''You are a JSON extractor. Given a Persian user instruction about a shopping request, extract a SearchSpec JSON matching the project's SearchSpec pydantic schema. The JSON must follow the schema exactly and use null for unknowns. Use currency IRR and prices in toman integers when possible. Output only the JSON object.'''
+SEARCH_SYSTEM = '''You are a JSON extractor. Given a Persian user instruction about a shopping request, extract a SearchSpec JSON matching the project's SearchSpec pydantic schema. The JSON must follow the schema exactly and use null for unknowns.
+
+Extract:
+- product.name: the product the user wants (e.g. «سیم مسی»). Do NOT include place names in product.name.
+- product.brand: brand if mentioned.
+- product.model, product.keywords, product.features when present.
+- price.min / price.max in toman integers when a budget is given; currency IRR.
+- location: when the user mentions a place, neighborhood, area, mall or street (phrases like «داخل تجریش», «در ونک», «نزدیک میدان ولیعصر», «اطراف پونک»):
+  - set location.city and location.address to that place name (e.g. «تجریش»).
+  - set location.latitude / location.longitude ONLY if the user explicitly gives numeric coordinates; never invent them.
+  - optional location.radius_km if the user specifies a distance.
+
+Output only the JSON object.'''
+
+
+def _normalize_location_dict(raw_location: Any) -> Dict[str, Any]:
+    """Map common LLM location shapes onto LocationSpec fields."""
+    location: Dict[str, Any] = {}
+    if isinstance(raw_location, dict):
+        place = (
+            raw_location.get("city")
+            or raw_location.get("text")
+            or raw_location.get("address")
+            or raw_location.get("area")
+        )
+        location = {
+            "city": place,
+            "area": raw_location.get("area"),
+            "address": raw_location.get("address") or place,
+            "latitude": raw_location.get("latitude", raw_location.get("lat")),
+            "longitude": raw_location.get("longitude", raw_location.get("lon", raw_location.get("lng"))),
+            "radius_km": raw_location.get("radius_km"),
+            "max_distance_km": raw_location.get("max_distance_km"),
+        }
+        location = {k: v for k, v in location.items() if v is not None}
+    elif isinstance(raw_location, str) and raw_location.strip():
+        place = raw_location.strip()
+        location = {"city": place, "address": place}
+    return location
 
 
 def _normalize_llm_search_output(parsed: Any) -> Dict[str, Any]:
@@ -18,9 +56,23 @@ def _normalize_llm_search_output(parsed: Any) -> Dict[str, Any]:
         out = {k: parsed[k] for k in ("product", "price", "location", "search_options", "conversation") if k in parsed}
         if "product" not in out:
             out["product"] = {}
+        # Merge common flat product fields some models put at top level
+        prod = out["product"] if isinstance(out["product"], dict) else {}
+        for flat_key, prod_key in (
+            ("product_name", "name"),
+            ("query", "name"),
+            ("name", "name"),
+            ("brand", "brand"),
+            ("model", "model"),
+        ):
+            if parsed.get(flat_key) is not None and not prod.get(prod_key):
+                prod[prod_key] = parsed[flat_key]
+        out["product"] = prod
         if "price" not in out:
             out["price"] = {}
-        if "location" not in out:
+        if "location" in out:
+            out["location"] = _normalize_location_dict(out["location"])
+        else:
             out["location"] = {}
         if "search_options" not in out:
             out["search_options"] = {}
@@ -46,15 +98,19 @@ def _normalize_llm_search_output(parsed: Any) -> Dict[str, Any]:
         price["max"] = parsed["max_price"]
     if parsed.get("currency"):
         price["currency"] = parsed["currency"]
-    raw_location = parsed.get("location")
-    location = {}
-    if isinstance(raw_location, dict):
-        location = {"city": raw_location.get("city") or raw_location.get("text"),
-                    "latitude": raw_location.get("latitude"), "longitude": raw_location.get("longitude"),
-                    "radius_km": raw_location.get("radius_km")}
-        location = {k: v for k, v in location.items() if v is not None}
-    elif isinstance(raw_location, str) and raw_location.strip():
-        location["city"] = raw_location.strip()
+    location = _normalize_location_dict(parsed.get("location"))
+    # Flat top-level location fields some models emit
+    if not location:
+        place = parsed.get("address") or parsed.get("city") or parsed.get("area")
+        flat = {}
+        if place:
+            flat["city"] = place
+            flat["address"] = place
+        if parsed.get("latitude") is not None or parsed.get("lat") is not None:
+            flat["latitude"] = parsed.get("latitude", parsed.get("lat"))
+        if parsed.get("longitude") is not None or parsed.get("lon") is not None or parsed.get("lng") is not None:
+            flat["longitude"] = parsed.get("longitude", parsed.get("lon", parsed.get("lng")))
+        location = {k: v for k, v in flat.items() if v is not None}
     options = {}
     if parsed.get("sort_by"):
         options["sort_by"] = parsed["sort_by"]

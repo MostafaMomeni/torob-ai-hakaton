@@ -3,7 +3,8 @@ from typing import Optional, List
 
 
 class LocationField(BaseModel):
-    text: Optional[str] = None
+    text: Optional[str] = None  # free-text place / address e.g. تجریش
+    address: Optional[str] = None  # alias for text when LLM returns "address"
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     radius_km: Optional[float] = None

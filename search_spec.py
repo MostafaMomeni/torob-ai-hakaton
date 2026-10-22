@@ -28,6 +28,7 @@ class PriceSpec(BaseModel):
 class LocationSpec(BaseModel):
     city: Optional[str] = None
     area: Optional[str] = None
+    address: Optional[str] = None  # free-text place name e.g. تجریش, ونک
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     radius_km: Optional[float] = None

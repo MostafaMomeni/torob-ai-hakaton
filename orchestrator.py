@@ -126,8 +126,11 @@ class Orchestrator:
                     entities["budget_toman"] = int(float(raw) * 10_0000)
                 except Exception:
                     pass
-        # location (اطراف X)
-        mloc = re.search(r"اطراف\s+([\wآ-ی\- ]+)", text)
+        # location phrases: اطراف / داخل / در / نزدیک / حوالی X
+        mloc = re.search(
+            r"(?:اطراف|داخل|در|نزدیک|حوالی|منطقه)\s+([\wآ-ی\- ]{2,40})",
+            text,
+        )
         if mloc:
             entities["location"] = mloc.group(1).strip()
         # product keywords: try to find model/brand in state or text
@@ -210,6 +213,10 @@ class Orchestrator:
                 {
                     "offer_id": o.offer_id,
                     "shop_id": o.shop_id,
+                    "shop": (
+                        self.repo.get_shop_details(o.shop_id)
+                        if hasattr(self.repo, "get_shop_details") else None
+                    ),
                     "price_toman": o.price_toman,
                     "price_type": "recorded",
                     "last_price_changed_at": (
@@ -363,18 +370,27 @@ class Orchestrator:
         # entities -> selected product or location
         ent = getattr(nlu, "entities", None)
         if ent:
-            if ent.location and ent.location.text:
-                old = state.active_filters.get("location")
-                state.active_filters["location"] = ent.location.text
-                state.filter_changes.append(
-                    {
-                        "ts": ts,
-                        "key": "location",
-                        "old": old,
-                        "new": ent.location.text,
-                        "action": "set",
-                    }
+            if ent.location:
+                place = (
+                    getattr(ent.location, "text", None)
+                    or getattr(ent.location, "address", None)
                 )
+                if place:
+                    old = state.active_filters.get("location")
+                    state.active_filters["location"] = place
+                    state.filter_changes.append(
+                        {
+                            "ts": ts,
+                            "key": "location",
+                            "old": old,
+                            "new": place,
+                            "action": "set",
+                        }
+                    )
+                if getattr(ent.location, "latitude", None) is not None:
+                    state.active_filters["latitude"] = ent.location.latitude
+                if getattr(ent.location, "longitude", None) is not None:
+                    state.active_filters["longitude"] = ent.location.longitude
             # product_name / brand hints: keep in confirmed_info for later local resolution
             if ent.product_name:
                 state.confirmed_info["product_name"] = ent.product_name
@@ -510,7 +526,11 @@ class Orchestrator:
 
     # ---------- Main handler ----------
     def handle_request(
-        self, text: str, state: Optional[ConversationState] = None
+        self,
+        text: str,
+        state: Optional[ConversationState] = None,
+        lat: Optional[float] = None,
+        lon: Optional[float] = None,
     ) -> Dict[str, Any]:
         self._ensure_loaded()
         if state is None:
@@ -519,6 +539,18 @@ class Orchestrator:
             )
         state.original_request = state.original_request or text
         state.last_updated = datetime.utcnow()
+
+        # Normalize optional API-provided user coordinates (used as search origin).
+        user_lat: Optional[float] = None
+        user_lon: Optional[float] = None
+        try:
+            if lat is not None and lon is not None:
+                user_lat = float(lat)
+                user_lon = float(lon)
+                if not (-90 <= user_lat <= 90 and -180 <= user_lon <= 180):
+                    user_lat = user_lon = None
+        except (TypeError, ValueError):
+            user_lat = user_lon = None
 
         # Prefer LLM-backed NLU analyzer if available; fall back to simple regex-based methods
         nlu = None
@@ -688,11 +720,23 @@ class Orchestrator:
                 entities["min_price"] = nlu.filters.min_price
             if getattr(nlu.filters, "max_price", None) is not None:
                 entities["max_price"] = nlu.filters.max_price
-            # location
-            if getattr(nlu.entities, "location", None) and getattr(
-                nlu.entities.location, "text", None
-            ):
-                entities["location"] = nlu.entities.location.text
+            # location (text / address / coords)
+            if getattr(nlu.entities, "location", None):
+                nlu_loc = nlu.entities.location
+                place = (
+                    getattr(nlu_loc, "text", None)
+                    or getattr(nlu_loc, "address", None)
+                )
+                if place:
+                    entities["location"] = place
+                if getattr(nlu_loc, "latitude", None) is not None:
+                    entities["latitude"] = nlu_loc.latitude
+                if getattr(nlu_loc, "longitude", None) is not None:
+                    entities["longitude"] = nlu_loc.longitude
+            # API-provided GPS overrides / supplements text location
+            if user_lat is not None and user_lon is not None:
+                entities["latitude"] = user_lat
+                entities["longitude"] = user_lon
             logger.info(f"Entities (from NLU+local resolution): {entities}")
             # Apply NLU result to conversation state (merge filters, handle references)
             try:
@@ -706,7 +750,39 @@ class Orchestrator:
             try:
                 spec = getattr(nlu, "search_spec", None) or search_spec
                 if spec:
-                    spec_dict = spec.dict() if hasattr(spec, "dict") else spec
+                    spec_dict = spec.dict() if hasattr(spec, "dict") else (
+                        dict(spec) if isinstance(spec, dict) else {}
+                    )
+                    # Inject API-provided user coordinates into location so distance
+                    # ranking / radius filtering use the caller's position.
+                    # Text-extracted place names (e.g. تجریش) stay in city/address.
+                    if user_lat is not None and user_lon is not None:
+                        loc = dict(spec_dict.get("location") or {})
+                        loc["latitude"] = user_lat
+                        loc["longitude"] = user_lon
+                        if loc.get("radius_km") is None and loc.get("max_distance_km") is None:
+                            # Sensible default radius when user shares GPS but no radius.
+                            loc.setdefault("radius_km", 15.0)
+                        spec_dict["location"] = loc
+                    # Also surface location text from NLU entities when SearchSpec
+                    # missed the place name (e.g. «سیم مسی داخل تجریش»).
+                    nlu_loc = getattr(getattr(nlu, "entities", None), "location", None)
+                    if nlu_loc is not None:
+                        place_text = (
+                            getattr(nlu_loc, "text", None)
+                            or getattr(nlu_loc, "address", None)
+                        )
+                        if place_text:
+                            loc = dict(spec_dict.get("location") or {})
+                            if not (loc.get("city") or loc.get("address") or loc.get("area")):
+                                loc["city"] = place_text
+                                loc["address"] = place_text
+                            # Prefer explicit coords from NLU if present and API did not supply any
+                            if user_lat is None and getattr(nlu_loc, "latitude", None) is not None:
+                                loc["latitude"] = nlu_loc.latitude
+                            if user_lon is None and getattr(nlu_loc, "longitude", None) is not None:
+                                loc["longitude"] = nlu_loc.longitude
+                            spec_dict["location"] = loc
                     try:
                         from product_search import run_structured_search
 
@@ -732,7 +808,49 @@ class Orchestrator:
         else:
             # Intent detection removed — treat free-text as a product search query
             entities = self._extract_entities(text, state)
+            if user_lat is not None and user_lon is not None:
+                entities["latitude"] = user_lat
+                entities["longitude"] = user_lon
             logger.info(f"Entities extracted: {entities}")
+
+            # Build a minimal structured search from local entities + API coords
+            # when the LLM path was unavailable.
+            try:
+                product_name = entities.get("product_name") or text
+                loc_dict = {}
+                if entities.get("location"):
+                    loc_dict["city"] = entities["location"]
+                    loc_dict["address"] = entities["location"]
+                if user_lat is not None and user_lon is not None:
+                    loc_dict["latitude"] = user_lat
+                    loc_dict["longitude"] = user_lon
+                    loc_dict.setdefault("radius_km", 15.0)
+                price_dict = {}
+                if entities.get("min_price") is not None:
+                    price_dict["min"] = entities["min_price"]
+                if entities.get("max_price") is not None:
+                    price_dict["max"] = entities["max_price"]
+                if entities.get("budget_toman") is not None:
+                    price_dict.setdefault("max", entities["budget_toman"])
+                if product_name or loc_dict:
+                    from product_search import run_structured_search
+                    ss_results = run_structured_search(
+                        self.repo,
+                        {
+                            "product": {"name": product_name},
+                            "price": price_dict,
+                            "location": loc_dict,
+                        },
+                        limit=state.active_filters.get("limit", 20) or 20,
+                    )
+                    structured_search_attempted = True
+                    response_products = ss_results
+                    if ss_results:
+                        reasons["note"] = "نتایج بر اساس نام محصول و فیلترهای ساختاریافته بازگشتی."
+                    else:
+                        reasons["note"] = "محصولی با نام و فیلترهای درخواستی پیدا نشد."
+            except Exception as e:
+                logger.warning("local structured_search failed: %s", e)
 
         missing = []
         # simple missing-info rules: require at least a product keyword, budget, or location to run a meaningful search
@@ -955,8 +1073,14 @@ class Orchestrator:
                         default=None,
                     )
                 if cheapest:
+                    shop = cheapest.get("shop") or {}
+                    shop_name = shop.get("name") if isinstance(shop, dict) else None
+                    distance = cheapest.get("distance_km")
+                    shop_suffix = f" - فروشگاه: {shop_name}" if shop_name else ""
+                    distance_suffix = f" - فاصله: {distance} کیلومتر" if distance is not None else ""
                     lines.append(
                         f"{p.get('persian_title') or p.get('product_id')} - کمترین قیمت: {cheapest.get('price_toman')} تومان"
+                        f"{shop_suffix}{distance_suffix}"
                     )
                 else:
                     lines.append(

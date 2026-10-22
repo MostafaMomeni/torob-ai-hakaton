@@ -19,6 +19,8 @@ class DataRepository:
         self._offers: Dict[str, Offer] = {}
         self._offers_by_product: Dict[str, List[Offer]] = {}
         self._offers_by_shop: Dict[str, List[Offer]] = {}
+        # Full shops.csv rows, including columns not represented by the Shop schema.
+        self._shop_details: Dict[str, Dict[str, object]] = {}
 
     def load_all(self):
         self._shops.clear()
@@ -26,16 +28,52 @@ class DataRepository:
         self._offers.clear()
         self._offers_by_product.clear()
         self._offers_by_shop.clear()
+        self._shop_details.clear()
         self._load_shops()
         self._load_products()
         self._load_offers()
 
+    @staticmethod
+    def _parse_shop_cell(key, value):
+        if value is None:
+            return None
+        value = value.strip() if isinstance(value, str) else value
+        if value == "":
+            return None
+        if key in ("lat", "lon"):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        if key == "supports_fast_delivery":
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ("1", "true", "yes", "y", "بله")
+        if key in ("category_names", "contacts", "payment_options", "weekly_hours"):
+            try:
+                return json.loads(value) if isinstance(value, str) else value
+            except (ValueError, TypeError):
+                return value
+        return value
+
     def _load_shops(self):
-        with self.shops_csv.open("r", encoding="utf-8") as f:
+        with self.shops_csv.open("r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for r in reader:
+                details = {key: self._parse_shop_cell(key, value) for key, value in r.items()}
+                shop_id = str(details.get("shop_id") or "").strip()
+                if shop_id:
+                    self._shop_details[shop_id] = details
                 try:
-                    raw = ShopRaw(**r)
+                    # Pass only fields represented by ShopRaw. shops.csv also has
+                    # useful metadata columns that may not exist in the Pydantic schema;
+                    # those are retained separately in _shop_details above.
+                    raw_fields = (
+                        "shop_id", "name", "address", "lat", "lon",
+                        "location_label", "category_names", "contacts",
+                        "website_url", "weekly_hours",
+                    )
+                    raw = ShopRaw(**{key: r.get(key) for key in raw_fields if key in r})
                 except Exception as e:
                     # skip invalid row but log
                     # use logging instead of printing to avoid noisy console output
@@ -137,7 +175,26 @@ class DataRepository:
 
     # Query APIs
     def get_shop(self, shop_id: str) -> Optional[Shop]:
-        return self._shops.get(shop_id)
+        return self._shops.get(str(shop_id)) if shop_id is not None else None
+
+    def get_shop_details(self, shop_id: str) -> Optional[Dict[str, object]]:
+        """Return normalized full shops.csv row, including extra metadata columns."""
+        if shop_id is None:
+            return None
+        details = self._shop_details.get(str(shop_id))
+        if details is not None:
+            return dict(details)
+        # Graceful fallback for repos/tests that populate Shop objects directly.
+        shop = self.get_shop(shop_id)
+        if shop is None:
+            return None
+        fields = ("shop_id", "name", "address", "category_names", "contacts",
+                  "instagram", "lat", "location_label", "lon", "payment_options",
+                  "supports_fast_delivery", "website_url", "weekly_hours")
+        return {key: getattr(shop, key, None) for key in fields}
+
+    def all_shops(self):
+        return list(self._shops.values())
 
     def get_product(self, product_id: str) -> Optional[Product]:
         return self._products.get(product_id)

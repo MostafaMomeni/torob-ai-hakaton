@@ -16,13 +16,18 @@ Follow this schema (keys): schema_version, language, user_goal, entities, filter
 
 - language should be "fa" for Persian.
 - The NLU should NOT emit an "intent" field. All user inputs must be interpreted as product search queries. Do not output any intent or intent-like values.
-- entities must include product_name, brand, category, model, features (array), location (object with text, latitude, longitude, radius_km).
+- entities must include product_name, brand, category, model, features (array), location (object with text, address, latitude, longitude, radius_km).
 - filters must include min_price, max_price, currency, brands, categories, features, sort_by.
 - context_reference must include previous_result_ids (array), selected_product_id, selected_store_id.
 - missing_information should be an array of strings indicating which pieces are missing for performing a product search (e.g., 'product_name', 'budget').
 - clarification_question should be null or a short Persian question when asking the user for info.
 - confidence should be a float 0.0-1.0.
 - raw_text should contain the original user input string (for debugging) but must NOT contain PII.
+
+Location extraction (critical):
+- If the user mentions a place, neighborhood, area, mall, or street (e.g. «سیم مسی داخل تجریش», «گوشی در ونک», «نزدیک میدان ولیعصر»), put that place name into entities.location.text AND entities.location.address.
+- Do NOT put the place name into product_name. Product name should be only the product (e.g. «سیم مسی»), location is separate (e.g. «تجریش»).
+- Only set latitude/longitude when the user explicitly provides numeric coordinates; never invent them.
 
 Rules:
 1) Output must be valid JSON parsable by a strict JSON parser. No surrounding markdown, comments, or text.

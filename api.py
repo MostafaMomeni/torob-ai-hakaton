@@ -26,6 +26,10 @@ orch = Orchestrator(repo=repo)
 class QueryRequest(BaseModel):
     text: str
     conversation_id: Optional[str] = None
+    # Optional user geolocation. When set, used as the search origin for
+    # distance ranking / radius filtering (overrides text-only location when both exist).
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 class QueryResponse(BaseModel):
     response_type: str
@@ -65,9 +69,9 @@ def query_endpoint(req: QueryRequest):
         except Exception:
             # if loading fails, continue with fresh state
             state = None
-    # call orchestrator
+    # call orchestrator; forward optional user coordinates for location-aware search
     try:
-        out = orch.handle_request(req.text, state)
+        out = orch.handle_request(req.text, state, lat=req.lat, lon=req.lon)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return out
