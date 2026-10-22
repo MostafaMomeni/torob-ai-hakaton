@@ -23,29 +23,29 @@ def normalize_price(value):
 
 
 class ShopRaw(BaseModel):
-    address: Optional[str]
-    category_names: Optional[str]
-    contacts: Optional[str]
-    instagram: Optional[str]
-    lat: Optional[float]
-    location_label: Optional[str]
-    lon: Optional[float]
-    name: Optional[str]
-    payment_options: Optional[str]
+    address: Optional[str] = None
+    category_names: Optional[str] = None
+    contacts: Optional[str] = None
+    instagram: Optional[str] = None
+    lat: Optional[float] = None
+    location_label: Optional[str] = None
+    lon: Optional[float] = None
+    name: Optional[str] = None
+    payment_options: Optional[str] = None
     shop_id: str
-    supports_fast_delivery: Optional[str]
-    website_url: Optional[str]
-    weekly_hours: Optional[str]
+    supports_fast_delivery: Optional[str] = None
+    website_url: Optional[str] = None
+    weekly_hours: Optional[str] = None
 
 
 class ProductRaw(BaseModel):
-    brand_name: Optional[str]
-    category_name: Optional[str]
-    image_urls: Optional[str]
-    model: Optional[str]
-    persian_title: Optional[str]
+    brand_name: Optional[str] = None
+    category_name: Optional[str] = None
+    image_urls: Optional[str] = None
+    model: Optional[str] = None
+    persian_title: Optional[str] = None
     product_id: str
-    specs: Optional[str]
+    specs: Optional[str] = None
 
 
 class OfferRaw(BaseModel):

@@ -286,36 +286,206 @@ def _distance_km(a, b):
     return radius * 2 * math.asin(min(1.0, math.sqrt(h)))
 
 
-def _resolve_text_location(repo, location_text):
-    """Resolve a place name from shop metadata when possible.
+def _shop_matches_place(details: Dict[str, Any], place_query: str) -> bool:
+    """Match a street/area query against the shop address robustly.
 
-    Without a geocoder, use coordinates of shops whose address/location label
-    contains the requested place and calculate their centroid. A caller can
-    pass latitude/longitude to avoid this approximation.
+    Persian addresses are inconsistent: they may use Arabic/Persian character
+    variants, punctuation, ZWNJ, abbreviations such as «خ», or different spacing.
+    A location query may be only a street name, not the complete address.
+    """
+    query = normalize_persian_text(place_query)
+    if not query:
+        return True
+
+    address = normalize_persian_text(details.get("address") or "")
+    label = normalize_persian_text(details.get("location_label") or "")
+    candidates = [value for value in (address, label) if value]
+    if not candidates:
+        return False
+
+    # Ignore generic address words; a query such as «خیابان» alone is too broad
+    # to identify a street and must not match every address.
+    generic = {
+        "خیابان", "خ", "کوچه", "ک", "بلوار", "بل", "میدان", "چهارراه",
+        "جنب", "روبروی", "روبرو", "پلاک", "واحد", "طبقه", "ساختمان",
+        "شهر", "استان", "ایران", "در", "واقع", "واقعشده", "آدرس",
+        "مغازه", "فروشگاه", "خیابانهای",
+    }
+    query_tokens = [t for t in query.split() if t not in generic and len(t) > 1]
+    if not query_tokens:
+        return False
+
+    # First try a contiguous phrase match, including a compact form so that
+    # «ولیعصر» and «ولی عصر» can match the same stored street name.
+    query_compact = "".join(query_tokens)
+    for candidate in candidates:
+        candidate_compact = candidate.replace(" ", "")
+        if " ".join(query_tokens) in candidate or query_compact in candidate_compact:
+            return True
+
+    # Require every remaining query token to match (AND, not loose OR).
+    for candidate in candidates:
+        address_tokens = set(candidate.split())
+        compact_address = candidate.replace(" ", "")
+        matched = 0
+        for token in query_tokens:
+            if token in address_tokens or token in compact_address:
+                matched += 1
+        if matched == len(query_tokens):
+            return True
+    return False
+
+
+def _resolve_text_location(repo, location_text):
+    """Find shop_ids whose address/location_label contain the place name.
+
+    Also returns the centroid of those shops' coordinates when available, used
+    only for secondary near-to-far ordering — never as a soft ranking substitute
+    for a hard address filter.
     """
     query = normalize_persian_text(location_text)
     if not query:
         return None, set()
     matched_coords, matched_shop_ids = [], set()
-    shops = getattr(repo, "_shops", {}).values()
-    for shop in shops:
-        details = _shop_details(repo, getattr(shop, "shop_id", None))
-        hay = normalize_persian_text(" ".join(str(details.get(k) or "") for k in
-            ("name", "address", "location_label")))
-        if query in hay:
-            coords = _shop_coordinates(details)
-            if coords:
-                matched_coords.append(coords)
-            if details.get("shop_id"):
-                matched_shop_ids.add(str(details["shop_id"]))
+    shops = getattr(repo, "_shops", {}) or {}
+    for shop_id, shop in shops.items():
+        details = _shop_details(repo, shop_id)
+        if not _shop_matches_place(details, query):
+            continue
+        matched_shop_ids.add(str(shop_id))
+        coords = _shop_coordinates(details)
+        if coords:
+            matched_coords.append(coords)
     if not matched_coords:
         return None, matched_shop_ids
-    return (sum(x[0] for x in matched_coords) / len(matched_coords),
-            sum(x[1] for x in matched_coords) / len(matched_coords)), matched_shop_ids
+    return (
+        sum(x[0] for x in matched_coords) / len(matched_coords),
+        sum(x[1] for x in matched_coords) / len(matched_coords),
+    ), matched_shop_ids
+
+
+def _brand_matches(requested: str, actual: str) -> bool:
+    """Strict brand condition (AND).
+
+    - If no brand was requested → pass.
+    - If brand was requested but product has no brand → fail.
+    - Otherwise requested brand must appear inside product brand_name
+      (normalized), so «سامسونگ» matches «سامسونگ» / «گوشی سامسونگ» but not «اپل».
+    """
+    if not requested:
+        return True
+    if not actual:
+        return False
+    req = normalize_persian_text(requested)
+    act = normalize_persian_text(actual)
+    if not req or not act:
+        return False
+    return req == act or req in act
+
+
+def _name_matches(requested_name: str, product) -> bool:
+    """Strict product-name condition (AND).
+
+    Every non-stopword token of the requested name must appear in the product
+    title (and optionally brand/model). A single shared token is not enough.
+    If no name was requested, this condition is not applied.
+    """
+    if not requested_name or not str(requested_name).strip():
+        return True
+    tokens = tokenize_persian(requested_name, remove_stopwords=True)
+    if not tokens:
+        # pure stopwords / noise → treat as no name filter
+        return True
+    title = normalize_persian_text(getattr(product, "persian_title", "") or "")
+    brand = normalize_persian_text(getattr(product, "brand_name", "") or "")
+    model = normalize_persian_text(getattr(product, "model", "") or "")
+    hay = f"{title} {brand} {model}".strip()
+    if not hay:
+        return False
+    # All query tokens must be present in the product text.
+    return all(tok in hay for tok in tokens)
+
+
+def _compact_shop(details: Dict[str, Any], distance_km=None) -> Dict[str, Any]:
+    """Fixed shop shape for every offer in the response."""
+    details = details or {}
+    phones = []
+    contacts = details.get("contacts")
+    if isinstance(contacts, list):
+        for c in contacts:
+            if isinstance(c, dict):
+                num = c.get("display_number") or c.get("number") or c.get("value")
+                if num:
+                    phones.append(str(num))
+            elif c:
+                phones.append(str(c))
+    elif isinstance(contacts, str) and contacts.strip():
+        phones.append(contacts.strip())
+
+    dist = None
+    if distance_km is not None:
+        try:
+            dist = round(float(distance_km), 3)
+        except (TypeError, ValueError):
+            dist = None
+
+    return {
+        "shop_id": details.get("shop_id") or None,
+        "name": details.get("name") or None,
+        "address": details.get("address") or None,
+        "location_label": details.get("location_label") or None,
+        "lat": details.get("lat") if details.get("lat") is not None else None,
+        "lon": details.get("lon") if details.get("lon") is not None else None,
+        "phones": phones[:3],
+        "distance_km": dist,
+    }
+
+
+def _compact_offer(offer, shop_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Fixed offer shape for every response item."""
+    shop_payload = shop_payload or _compact_shop({})
+    return {
+        "offer_id": getattr(offer, "offer_id", None),
+        "price_toman": getattr(offer, "price_toman", None),
+        "warranty": getattr(offer, "warranty", None) or None,
+        "shop_id": getattr(offer, "shop_id", None),
+        "distance_km": shop_payload.get("distance_km"),
+        "shop": shop_payload,
+    }
+
+
+def _compact_product(product_id, persian_title, brand_name, model, offers, nearest_distance=None) -> Dict[str, Any]:
+    """Fixed product shape — always the same keys."""
+    return {
+        "product_id": product_id,
+        "persian_title": persian_title or None,
+        "brand_name": brand_name or None,
+        "model": model or None,
+        "nearest_shop_distance_km": (
+            round(nearest_distance, 3) if nearest_distance is not None else None
+        ),
+        "offers": offers or [],
+    }
 
 
 def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int = 50) -> List[Dict[str, Any]]:
-    """Search by product name, apply price and brand filters, then rank by shop proximity."""
+    """AND search pipeline — every active condition must hold.
+
+    Conditions (when provided):
+      • product name  — all name tokens must appear in the product title
+      • brand         — product brand_name must contain the requested brand
+      • location text — every surviving offer's shop address/location_label
+                        must contain the place name
+      • GPS + radius  — offer shop must be within radius_km of (lat, lon)
+      • min/max price — offer price must fall in range
+      • features      — each feature term must appear in product text
+
+    A product enters the result list only if it matches name+brand+features
+    AND has at least one offer that satisfies price+location. Otherwise it is
+    dropped. Empty list means nothing satisfied all conditions.
+
+    Output shape is always the same for every product/offer/shop.
+    """
     spec = _plain(spec)
     product = _plain(spec.get("product", {}))
     price = _plain(spec.get("price", {}))
@@ -328,33 +498,71 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
         keywords = [keywords]
     brand = product.get("brand") or spec.get("brand")
     model = product.get("model") or spec.get("model")
-    requested_brand = normalize_persian_text(brand)
+    requested_brand = (brand or "").strip()
 
-    ps = ProductSearcher(repo)
-    # Retrieve based on product identity first. Brand is a hard filter below,
-    # not an alternate query that can introduce unrelated products.
-    candidates = ps.retrieve_candidates(
-        name, keywords, brand=None, model=model, limit=max(limit * 30, 1000)
-    )
+    # Name is a required AND condition when present: no name match → no results.
+    if name and str(name).strip():
+        ps = ProductSearcher(repo)
+        # Broad retrieval first, then hard _name_matches filter below.
+        candidates = ps.retrieve_candidates(
+            name, keywords, brand=None, model=model, limit=max(limit * 30, 1000)
+        )
+    elif keywords or model:
+        ps = ProductSearcher(repo)
+        candidates = ps.retrieve_candidates(
+            None, keywords, brand=None, model=model, limit=max(limit * 30, 1000)
+        )
+    else:
+        # No product identity at all → cannot satisfy name condition.
+        return []
+
+    # Hard AND: name
+    if name and str(name).strip():
+        candidates = [
+            c for c in candidates
+            if (p := repo.get_product(c["product_id"])) is not None
+            and _name_matches(name, p)
+        ]
+    if not candidates:
+        return []
+
+    # Hard AND: brand (only among name-matched products)
+    if requested_brand:
+        candidates = [
+            c for c in candidates
+            if (p := repo.get_product(c["product_id"])) is not None
+            and _brand_matches(requested_brand, getattr(p, "brand_name", "") or "")
+        ]
+        if not candidates:
+            return []
 
     min_price = price.get("min", spec.get("min_price"))
     max_price = price.get("max", spec.get("max_price"))
+
+    # Street/address text is more specific than city. Do not let a generic
+    # city value override the street name the user actually supplied.
     loc_value = (
-        location.get("city")
+        location.get("address")
         or location.get("text")
-        or location.get("address")
         or location.get("area")
+        or location.get("city")
     )
     if not loc_value and isinstance(spec.get("location"), str):
         loc_value = spec["location"]
     location_query = normalize_persian_text(loc_value) if loc_value else ""
-    # Prefer explicit lat/lon from the request (API user GPS or LLM coords).
-    target_coords = _coordinates(location)
-    matched_location_shop_ids = set()
-    if target_coords is None and location_query:
-        target_coords, matched_location_shop_ids = _resolve_text_location(repo, loc_value)
+    address_hard_filter = bool(location_query)
 
-    radius_km = location.get("radius_km")
+    target_coords = _coordinates(location)
+    matched_location_shop_ids: set = set()
+    if location_query:
+        centroid, matched_location_shop_ids = _resolve_text_location(repo, loc_value)
+        # Place name with zero matching shops → nothing can satisfy location AND.
+        if not matched_location_shop_ids:
+            return []
+        if target_coords is None:
+            target_coords = centroid
+
+    radius_km = location.get("radius_km") or location.get("max_distance_km")
     try:
         radius_km = float(radius_km) if radius_km is not None else None
     except (TypeError, ValueError):
@@ -373,6 +581,7 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
 
     sort_by = str(options.get("sort_by") or spec.get("sort_by") or "relevance").lower()
     ranked = []
+    ps = ProductSearcher(repo)
 
     for candidate in candidates:
         pid = candidate["product_id"]
@@ -380,12 +589,7 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
         if not p:
             continue
 
-        # Brand is a strict filter against the product's brand field.
-        if requested_brand:
-            actual_brand = normalize_persian_text(getattr(p, "brand_name", "") or "")
-            if requested_brand not in actual_brand:
-                continue
-
+        # Hard AND: features
         if feature_terms:
             searchable = normalize_persian_text(
                 _flatten(getattr(p, "specs", None)) + " " +
@@ -402,110 +606,85 @@ def run_structured_search(repo: DataRepository, spec: Dict[str, Any], limit: int
                 amount = float(offer.price_toman)
             except (ValueError, TypeError):
                 continue
-            # Stage 2: price constraints.
+
+            # Hard AND: price
             if min_price is not None and amount < float(min_price):
                 continue
             if max_price is not None and amount > float(max_price):
                 continue
 
-            # Stage 3: location metadata and distance ranking.
             details = _shop_details(repo, getattr(offer, "shop_id", None))
+            shop_id_str = str(details.get("shop_id") or offer.shop_id or "")
+
+            # Hard AND: location text — shop must be in the resolved place set
+            if address_hard_filter:
+                if shop_id_str not in matched_location_shop_ids:
+                    continue
+
             shop_coords = _shop_coordinates(details)
-            distance_km = _distance_km(target_coords, shop_coords) if target_coords and shop_coords else None
-            if radius_km is not None and distance_km is not None and distance_km > radius_km:
-                continue
-            if radius_km is not None and target_coords and shop_coords is None:
-                continue
+            distance_km = (
+                _distance_km(target_coords, shop_coords)
+                if target_coords and shop_coords
+                else None
+            )
+            # Hard AND: radius when GPS (+ optional radius) is active
+            if radius_km is not None:
+                if distance_km is None or distance_km > radius_km:
+                    continue
 
-            shop_payload = {key: details.get(key) for key in (
-                "shop_id", "name", "address", "category_names", "contacts", "instagram",
-                "lat", "location_label", "lon", "payment_options", "supports_fast_delivery",
-                "website_url", "weekly_hours"
-            ) if details.get(key) is not None}
-            offer_payload = {
-                "offer_id": offer.offer_id,
-                "price_toman": offer.price_toman,
-                "shop_id": offer.shop_id,
-                "shop": shop_payload or None,
-                "distance_km": round(distance_km, 3) if distance_km is not None else None,
-                "last_price_changed_at": offer.last_price_changed_at.isoformat() if offer.last_price_changed_at else None,
-                "warranty_recorded": getattr(offer, "warranty", None),
-            }
-            offers.append(offer_payload)
+            shop_payload = _compact_shop(details, distance_km=distance_km)
+            offers.append(_compact_offer(offer, shop_payload))
 
-        has_offer_constraints = min_price is not None or max_price is not None or radius_km is not None
-        if has_offer_constraints and not offers:
+        # Product only survives if at least one offer passed every offer-level AND.
+        if not offers:
             continue
 
-        # When the text location could not be geocoded, still prefer offers whose
-        # shop metadata explicitly mentions that place; otherwise preserve results.
-        for offer_payload in offers:
-            if location_query and target_coords is None:
-                details = offer_payload.get("shop") or {}
-                shop_text = normalize_persian_text(" ".join(str(details.get(k) or "") for k in
-                    ("name", "address", "location_label")))
-                offer_payload["location_text_match"] = bool(
-                    location_query in shop_text or str(offer_payload.get("shop_id") or "") in matched_location_shop_ids
-                )
-
-        rec = candidate["match_record"]
-        valid_distances = [o["distance_km"] for o in offers if o["distance_km"] is not None]
+        rec = candidate.get("match_record")
+        valid_distances = [
+            o.get("distance_km") for o in offers if o.get("distance_km") is not None
+        ]
         nearest_distance = min(valid_distances) if valid_distances else None
-        location_text_match = any(o.get("location_text_match") for o in offers)
-        cheapest = min((float(o["price_toman"]) for o in offers), default=float("inf"))
+        cheapest = min(
+            (float(o["price_toman"]) for o in offers if o.get("price_toman") is not None),
+            default=float("inf"),
+        )
+        tier = getattr(rec, "tier", 7) if rec else 7
+        name_score = getattr(rec, "name_relevance_score", 0.0) if rec else 0.0
+        coverage = ps.token_coverage(rec) if rec else 0.0
 
         if target_coords is not None:
-            # Proximity takes precedence when a location was explicitly supplied.
-            key = (nearest_distance if nearest_distance is not None else float("inf"),
-                   rec.tier, -rec.name_relevance_score, cheapest)
-        elif location_query:
-            key = (0 if location_text_match else 1, rec.tier,
-                   -rec.name_relevance_score, cheapest)
+            key = (
+                nearest_distance if nearest_distance is not None else float("inf"),
+                tier,
+                -name_score,
+                cheapest,
+            )
         elif sort_by in ("price_asc", "price_low_to_high", "cheapest", "price"):
-            key = (cheapest, rec.tier, -rec.name_relevance_score)
+            key = (cheapest, tier, -name_score)
         elif sort_by in ("price_desc", "price_high_to_low", "most_expensive"):
-            key = (-cheapest, rec.tier, -rec.name_relevance_score)
+            key = (-cheapest, tier, -name_score)
         else:
-            key = (rec.tier, -rec.name_relevance_score, -ps.token_coverage(rec), cheapest)
+            key = (tier, -name_score, -coverage, cheapest)
 
-        # Offers themselves are also sorted by proximity when coordinates exist.
         if target_coords is not None:
             offers.sort(key=lambda o: (
-                o["distance_km"] if o["distance_km"] is not None else float("inf"),
-                float(o["price_toman"])
+                o.get("distance_km") if o.get("distance_km") is not None else float("inf"),
+                float(o.get("price_toman") or 0),
             ))
         else:
-            offers.sort(key=lambda o: (
-                0 if o.get("location_text_match") else 1,
-                float(o["price_toman"])
-            ))
-        ranked.append((key, candidate, offers, cheapest, nearest_distance))
+            offers.sort(key=lambda o: float(o.get("price_toman") or 0))
+
+        ranked.append((key, candidate, offers, nearest_distance))
 
     ranked.sort(key=lambda x: x[0])
     results = []
-    for rank, (_, candidate, offers, cheapest, nearest_distance) in enumerate(
-        ranked[:max(1, int(limit))], 1
-    ):
-        rec = candidate["match_record"]
-        rec.final_rank = rank
-        results.append({
-            "product_id": candidate["product_id"],
-            "persian_title": candidate["persian_title"],
-            "brand_name": candidate.get("brand_name"),
-            "model": candidate.get("model"),
-            "specs": candidate.get("specs"),
-            "nearest_shop_distance_km": round(nearest_distance, 3) if nearest_distance is not None else None,
-            "offers": offers,
-            "match_record": {
-                "stages": rec.stages,
-                "matched_phrases": rec.matched_phrases,
-                "matched_tokens": sorted(rec.matched_tokens),
-                "name_relevance_score": rec.name_relevance_score,
-                "token_match_count": rec.token_match_count,
-                "token_coverage": ps.token_coverage(rec),
-                "tier": rec.tier,
-                "sort_score": round(rec.name_relevance_score + 1000 / max(1, rec.tier), 4),
-                "final_rank": rank,
-            },
-        })
+    for _, candidate, offers, nearest_distance in ranked[:max(1, int(limit))]:
+        results.append(_compact_product(
+            product_id=candidate["product_id"],
+            persian_title=candidate.get("persian_title"),
+            brand_name=candidate.get("brand_name"),
+            model=candidate.get("model"),
+            offers=offers,
+            nearest_distance=nearest_distance,
+        ))
     return results

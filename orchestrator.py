@@ -206,38 +206,22 @@ class Orchestrator:
         return results
 
     def _product_with_offers(self, p: Product) -> Dict[str, Any]:
+        from product_search import _shop_details, _compact_shop, _compact_offer
         offers = self.repo.get_offers_by_product(p.product_id)
         offer_dicts = []
         for o in offers:
-            offer_dicts.append(
-                {
-                    "offer_id": o.offer_id,
-                    "shop_id": o.shop_id,
-                    "shop": (
-                        self.repo.get_shop_details(o.shop_id)
-                        if hasattr(self.repo, "get_shop_details") else None
-                    ),
-                    "price_toman": o.price_toman,
-                    "price_type": "recorded",
-                    "last_price_changed_at": (
-                        o.last_price_changed_at.isoformat()
-                        if o.last_price_changed_at
-                        else None
-                    ),
-                    "data_source": o.data_source,
-                    "warranty_recorded": o.warranty,
-                }
-            )
+            details = _shop_details(self.repo, o.shop_id)
+            shop_payload = _compact_shop(details)
+            offer_dicts.append(_compact_offer(o, shop_payload))
         return {
             "product_id": p.product_id,
             "persian_title": p.persian_title,
             "brand_name": p.brand_name,
             "model": p.model,
-            "specs": p.specs,
             "offers": sorted(
                 offer_dicts,
                 key=lambda x: (
-                    x["price_toman"] if x["price_toman"] is not None else 10**18
+                    x["price_toman"] if x.get("price_toman") is not None else 10**18
                 ),
             ),
         }
@@ -700,21 +684,24 @@ class Orchestrator:
             # Since intent is removed, treat every NLU output as a product-search input.
             entities = {}
             # Resolve product-related fields using NLU entities when present
-            if nlu.entities and (
-                nlu.entities.product_name
-                or nlu.entities.brand
-                or nlu.entities.model
-            ):
-                qparts = []
-                if nlu.entities.brand:
-                    qparts.append(nlu.entities.brand)
+            if nlu.entities:
                 if nlu.entities.product_name:
-                    qparts.append(nlu.entities.product_name)
+                    entities["product_name"] = nlu.entities.product_name
+                if nlu.entities.brand:
+                    entities["brand"] = nlu.entities.brand
                 if nlu.entities.model:
-                    qparts.append(nlu.entities.model)
-                q = " ".join(qparts)
-                local_entities = self._extract_entities(q, state)
-                entities.update(local_entities)
+                    entities["model"] = nlu.entities.model
+                if nlu.entities.product_name or nlu.entities.brand or nlu.entities.model:
+                    qparts = []
+                    if nlu.entities.brand:
+                        qparts.append(nlu.entities.brand)
+                    if nlu.entities.product_name:
+                        qparts.append(nlu.entities.product_name)
+                    if nlu.entities.model:
+                        qparts.append(nlu.entities.model)
+                    q = " ".join(qparts)
+                    local_entities = self._extract_entities(q, state)
+                    entities.update(local_entities)
             # budget mapping
             if getattr(nlu.filters, "min_price", None) is not None:
                 entities["min_price"] = nlu.filters.min_price
@@ -760,9 +747,6 @@ class Orchestrator:
                         loc = dict(spec_dict.get("location") or {})
                         loc["latitude"] = user_lat
                         loc["longitude"] = user_lon
-                        if loc.get("radius_km") is None and loc.get("max_distance_km") is None:
-                            # Sensible default radius when user shares GPS but no radius.
-                            loc.setdefault("radius_km", 15.0)
                         spec_dict["location"] = loc
                     # Also surface location text from NLU entities when SearchSpec
                     # missed the place name (e.g. «سیم مسی داخل تجریش»).
@@ -783,6 +767,17 @@ class Orchestrator:
                             if user_lon is None and getattr(nlu_loc, "longitude", None) is not None:
                                 loc["longitude"] = nlu_loc.longitude
                             spec_dict["location"] = loc
+                    # Ensure product name + brand from NLU are hard conditions on the spec
+                    prod = dict(spec_dict.get("product") or {})
+                    nlu_ent = getattr(nlu, "entities", None)
+                    if nlu_ent is not None:
+                        if not prod.get("name") and getattr(nlu_ent, "product_name", None):
+                            prod["name"] = nlu_ent.product_name
+                        if not prod.get("brand") and getattr(nlu_ent, "brand", None):
+                            prod["brand"] = nlu_ent.brand
+                        if not prod.get("model") and getattr(nlu_ent, "model", None):
+                            prod["model"] = nlu_ent.model
+                    spec_dict["product"] = prod
                     try:
                         from product_search import run_structured_search
 
@@ -824,7 +819,6 @@ class Orchestrator:
                 if user_lat is not None and user_lon is not None:
                     loc_dict["latitude"] = user_lat
                     loc_dict["longitude"] = user_lon
-                    loc_dict.setdefault("radius_km", 15.0)
                 price_dict = {}
                 if entities.get("min_price") is not None:
                     price_dict["min"] = entities["min_price"]
@@ -868,136 +862,75 @@ class Orchestrator:
         status = "success"
         next_q = None
 
-        # Do not replace a valid structured search with a broad price-only fallback
-        # when the structured search correctly found no matching products.
+        # Fallback only when structured search was never attempted.
+        # Always go through run_structured_search so name/brand/location/price
+        # remain hard AND conditions — never return unfiltered products.
         if not response_products and not structured_search_attempted:
             response_products = []
             reasons = {}
             try:
-                # Prefer explicit product ids if available
-                pids = entities.get("product_ids") or entities.get("refer_product_ids")
-                if pids:
-                    response_products = self._search_products(product_ids=pids, limit=10)
-                    reasons["note"] = "نتایج بر اساس شناسه/کلیدواژه محصول یافت شد."
+                from product_search import run_structured_search
+
+                product_name = None
+                brand = None
+                if entities.get("product_ids") or entities.get("refer_product_ids"):
+                    # explicit ids still go through structured path with name from text
+                    product_name = text
                 else:
-                    # budget-based search
-                    budget = (
-                        entities.get("budget_toman")
-                        or entities.get("min_price")
-                        or entities.get("max_price")
+                    product_name = (
+                        entities.get("product_name")
+                        or entities.get("query")
+                        or text
                     )
-                    if budget and isinstance(budget, (int, float)):
-                        offers = [
-                            o
-                            for o in self.repo._offers.values()
-                            if o.price_toman and o.price_toman <= int(budget)
-                        ]
-                        prodmap = {}
-                        for o in offers:
-                            prodmap.setdefault(o.product_id, []).append(o)
-                        for pid, ofs in prodmap.items():
-                            p = self.repo.get_product(pid)
-                            if p:
-                                response_products.append(
-                                    {
-                                        "product_id": pid,
-                                        "persian_title": p.persian_title,
-                                        "offers": sorted(
-                                            [
-                                                {
-                                                    "offer_id": o.offer_id,
-                                                    "price_toman": o.price_toman,
-                                                    "shop_id": o.shop_id,
-                                                }
-                                                for o in ofs
-                                            ],
-                                            key=lambda x: x["price_toman"],
-                                        ),
-                                    }
-                                )
-                        reasons["note"] = (
-                            f"محصولاتی با قیمت حداکثر {budget} تومان فیلتر شدند."
-                        )
-                    else:
-                        # location-based shopping
-                        loc = entities.get("location")
-                        if loc:
-                            state.active_filters["location"] = loc
-                            reasons["note"] = f'فیلتر مکانی روی "{loc}" قرار گرفت.'
-                            matches = [
-                                s
-                                for s in self.repo._shops.values()
-                                if s.location_label and loc in (s.location_label.lower())
-                            ]
-                            if not matches:
-                                matches = [
-                                    s
-                                    for s in self.repo._shops.values()
-                                    if s.address and loc in s.address.lower()
-                                ]
-                            stores = [
-                                {
-                                    "shop_id": s.shop_id,
-                                    "name": s.name,
-                                    "address": s.address,
-                                    "location_label": s.location_label,
-                                }
-                                for s in matches[:20]
-                            ]
-                            offers = []
-                            for s in matches[:20]:
-                                offers.extend(
-                                    [
-                                        {
-                                            "offer_id": o.offer_id,
-                                            "product_id": o.product_id,
-                                            "price_toman": o.price_toman,
-                                            "shop_id": s.shop_id,
-                                        }
-                                        for o in self.repo.get_offers_by_shop(s.shop_id)
-                                    ]
-                                )
-                            prodmap = {}
-                            for o in offers:
-                                prodmap.setdefault(o["product_id"], []).append(o)
-                            for pid, ofs in prodmap.items():
-                                p = self.repo.get_product(pid)
-                                if p:
-                                    response_products.append(
-                                        {
-                                            "product_id": pid,
-                                            "persian_title": p.persian_title,
-                                            "offers": sorted(
-                                                ofs,
-                                                key=lambda x: (
-                                                    x["price_toman"]
-                                                    if x["price_toman"] is not None
-                                                    else 10**18
-                                                ),
-                                            ),
-                                        }
-                                    )
-                        else:
-                            # full-text query fallback
-                            response_products = self._search_products(query=text, limit=10)
-                            if response_products:
-                                reasons["note"] = "نتایج بر اساس جستجوی متن کامل."
-                            else:
-                                response_products = self._search_products(limit=10)
-                                reasons["note"] = "نتایج پیش‌فرض (برگشتی به عنوان پیش‌فرض)."
+                brand = entities.get("brand")
+                loc = entities.get("location")
+                loc_dict = {}
+                if loc:
+                    loc_dict["city"] = loc
+                    loc_dict["address"] = loc
+                if entities.get("latitude") is not None and entities.get("longitude") is not None:
+                    loc_dict["latitude"] = entities["latitude"]
+                    loc_dict["longitude"] = entities["longitude"]
+                price_dict = {}
+                if entities.get("min_price") is not None:
+                    price_dict["min"] = entities["min_price"]
+                if entities.get("max_price") is not None:
+                    price_dict["max"] = entities["max_price"]
+                if entities.get("budget_toman") is not None:
+                    price_dict.setdefault("max", entities["budget_toman"])
+
+                ss_results = run_structured_search(
+                    self.repo,
+                    {
+                        "product": {
+                            "name": product_name,
+                            "brand": brand,
+                        },
+                        "price": price_dict,
+                        "location": loc_dict,
+                    },
+                    limit=state.active_filters.get("limit", 20) or 20,
+                )
+                structured_search_attempted = True
+                response_products = ss_results
+                if ss_results:
+                    reasons["note"] = "نتایج بر اساس نام محصول و فیلترهای ساختاریافته."
+                else:
+                    reasons["note"] = "محصولی که همه شرط‌ها را داشته باشد پیدا نشد."
             except Exception as e:
                 status = "error"
+                logger.warning("fallback structured_search failed: %s", e)
                 return {
                     "response_type": "error",
-                    "status": status,
+                    "status": "error",
                     "text": "هنگام پردازش درخواست خطا رخ داد: " + str(e),
                     "products": [],
                     "stores": [],
                     "reasons": {},
-                    "price_update_times": {},
-                    "inventory_status": {},
+                    "applied_filters": {},
                     "unknowns": missing,
                     "next_question": None,
+                    "conversation_id": state.conversation_id,
                     "saved_state_snapshot": state.snapshot(),
                 }
 
@@ -1011,101 +944,126 @@ class Orchestrator:
                 next_q = "لطفا بگویید دنبال چه محصولی هستید یا بودجه و برند مورد نظر را بنویسید."
                 missing.append("product_keyword")
 
-        # prepare structured output
-        price_updates = {}
-        inventory_status = {}
-        for p in response_products:
-            for o in p.get("offers", []):
-                pid = p.get("product_id")
-                key = o.get("offer_id") or f"{pid}:{o.get('shop_id')}"
-                price_updates[key] = (
-                    o.get("last_price_changed_at")
-                    if o.get("last_price_changed_at")
-                    else None
-                )
-                # infer availability: if last_price_changed_at recent -> likely available
-                if o.get("last_price_changed_at"):
-                    try:
-                        dt = datetime.fromisoformat(o.get("last_price_changed_at"))
-                        inventory_status[key] = {
-                            "likely_available": not is_stale(dt, days_threshold=30),
-                            "age_days": compute_staleness(dt),
-                        }
-                    except Exception:
-                        inventory_status[key] = {
-                            "likely_available": False,
-                            "age_days": None,
-                        }
-                else:
-                    inventory_status[key] = {
-                        "likely_available": False,
-                        "age_days": None,
-                    }
-
         # update state
         state.previous_results["products"] = response_products
-        # set selected product if single
         if len(response_products) == 1:
             state.selected_product_ids = [response_products[0]["product_id"]]
         state.last_updated = datetime.utcnow()
-        # preserve visit plans and followups already in state
         try:
             self.save_state(state)
         except Exception:
-            # state persistence should not break handler; log and continue
             logger.warning("save_state failed; continuing without persistence")
 
-        # build Persian text summary
+        # build Persian text summary (compact, includes brand + shop address)
         if status == "error":
             text = "متأسفم، مشکلی پیش آمد."
         elif not response_products:
             text = "نتیجه‌ای پیدا نشد."
         else:
-            # summarize top 3 products
             lines = []
-            for p in response_products[:3]:
-                offers = p.get("offers", [])
-                cheapest = None
-                if offers:
-                    cheapest = min(
-                        [o for o in offers if o.get("price_toman") is not None],
-                        key=lambda x: x.get("price_toman"),
-                        default=None,
-                    )
-                if cheapest:
+            for p in response_products[:5]:
+                title = p.get("persian_title") or p.get("product_id") or ""
+                brand = p.get("brand_name")
+                brand_part = f" | برند: {brand}" if brand else ""
+                offers = p.get("offers") or []
+                priced = [o for o in offers if o.get("price_toman") is not None]
+                if priced:
+                    cheapest = min(priced, key=lambda x: x["price_toman"])
                     shop = cheapest.get("shop") or {}
-                    shop_name = shop.get("name") if isinstance(shop, dict) else None
+                    shop_name = shop.get("name") or ""
+                    address = shop.get("address") or shop.get("location_label") or ""
                     distance = cheapest.get("distance_km")
-                    shop_suffix = f" - فروشگاه: {shop_name}" if shop_name else ""
-                    distance_suffix = f" - فاصله: {distance} کیلومتر" if distance is not None else ""
-                    lines.append(
-                        f"{p.get('persian_title') or p.get('product_id')} - کمترین قیمت: {cheapest.get('price_toman')} تومان"
-                        f"{shop_suffix}{distance_suffix}"
-                    )
+                    parts = [
+                        f"{title}{brand_part}",
+                        f"قیمت: {cheapest['price_toman']:,} تومان".replace(",", "٬"),
+                    ]
+                    if shop_name:
+                        parts.append(f"فروشگاه: {shop_name}")
+                    if address:
+                        parts.append(f"آدرس: {address}")
+                    if distance is not None:
+                        parts.append(f"فاصله: {distance} کیلومتر")
+                    lines.append(" — ".join(parts))
                 else:
-                    lines.append(
-                        f"{p.get('persian_title') or p.get('product_id')} - قیمت در دسترس نیست"
-                    )
-            text = "پیشنهادها:" + "\n".join(lines)
+                    lines.append(f"{title}{brand_part} — قیمت در دسترس نیست")
+            text = "پیشنهادها:\n" + "\n".join(lines)
             if next_q:
                 text += "\n\n" + next_q
 
-        # Always return a structured out dict (avoid falling through to None)
+        # Normalize every product/offer to the fixed response shape.
+        from product_search import _compact_product, _compact_offer, _compact_shop, _shop_details
+        normalized_products = []
+        for p in response_products or []:
+            if not isinstance(p, dict):
+                continue
+            offers_in = p.get("offers") or []
+            offers_out = []
+            for o in offers_in:
+                if not isinstance(o, dict):
+                    continue
+                shop = o.get("shop") if isinstance(o.get("shop"), dict) else {}
+                if not shop and o.get("shop_id"):
+                    shop = _compact_shop(_shop_details(self.repo, o.get("shop_id")), o.get("distance_km"))
+                else:
+                    shop = {
+                        "shop_id": shop.get("shop_id"),
+                        "name": shop.get("name"),
+                        "address": shop.get("address"),
+                        "location_label": shop.get("location_label"),
+                        "lat": shop.get("lat"),
+                        "lon": shop.get("lon"),
+                        "phones": shop.get("phones") or [],
+                        "category_names": shop.get("category_names"),
+                        "instagram": shop.get("instagram"),
+                        "website_url": shop.get("website_url"),
+                        "payment_options": shop.get("payment_options"),
+                        "supports_fast_delivery": shop.get("supports_fast_delivery"),
+                        "weekly_hours": shop.get("weekly_hours"),
+                        "distance_km": shop.get("distance_km", o.get("distance_km")),
+                    }
+                offers_out.append({
+                    "offer_id": o.get("offer_id"),
+                    "price_toman": o.get("price_toman"),
+                    "warranty": o.get("warranty") or o.get("warranty_recorded"),
+                    "shop_id": o.get("shop_id") or shop.get("shop_id"),
+                    "distance_km": o.get("distance_km", shop.get("distance_km")),
+                    "shop": shop,
+                })
+            normalized_products.append({
+                "product_id": p.get("product_id"),
+                "persian_title": p.get("persian_title"),
+                "brand_name": p.get("brand_name"),
+                "model": p.get("model"),
+                "nearest_shop_distance_km": p.get("nearest_shop_distance_km"),
+                "sort_score": p.get("sort_score", 0.0),
+                "offers": offers_out,
+            })
+
+        applied_filters = {
+            "product_name": entities.get("product_name") or entities.get("query"),
+            "brand": entities.get("brand"),
+            "location": entities.get("location"),
+            "min_price": entities.get("min_price"),
+            "max_price": entities.get("max_price") or entities.get("budget_toman"),
+            "lat": entities.get("latitude"),
+            "lon": entities.get("longitude"),
+        }
+        # drop null-only noise keys but keep the fixed key set
+        applied_filters = {k: (v if v is not None else None) for k, v in applied_filters.items()}
+
         out = {
             "response_type": (
                 "search_result"
-                if response_products
+                if normalized_products
                 else ("clarification" if missing else "empty")
             ),
             "status": status,
             "text": text,
-            "products": response_products,
-            "stores": stores,
-            "reasons": reasons,
-            "price_update_times": price_updates,
-            "inventory_status": inventory_status,
-            "unknowns": missing,
+            "products": normalized_products,
+            "applied_filters": applied_filters,
+            "unknowns": missing or [],
             "next_question": next_q,
+            "conversation_id": state.conversation_id,
             "saved_state_snapshot": state.snapshot(),
         }
         return out

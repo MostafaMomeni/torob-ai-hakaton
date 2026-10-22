@@ -32,17 +32,22 @@ class QueryRequest(BaseModel):
     lon: Optional[float] = None
 
 class QueryResponse(BaseModel):
-    response_type: str
-    status: str
+    """Fixed response schema returned by every /v1/query call.
+
+    products[] item shape:
+      product_id, persian_title, brand_name, model, nearest_shop_distance_km,
+      offers: [{ offer_id, price_toman, warranty, shop_id, distance_km,
+                 shop: { shop_id, name, address, location_label, lat, lon, phones, distance_km } }]
+    """
+    response_type: str  # search_result | empty | clarification | error
+    status: str         # success | partial | error
     text: str
     products: List[Dict[str, Any]]
-    stores: List[Dict[str, Any]]
-    reasons: Dict[str, Any]
-    price_update_times: Dict[str, Any]
-    inventory_status: Dict[str, Any]
-    unknowns: List[str]
-    next_question: Optional[str]
-    saved_state_snapshot: Dict[str, Any]
+    applied_filters: Dict[str, Any] = {}
+    unknowns: List[str] = []
+    next_question: Optional[str] = None
+    conversation_id: Optional[str] = None
+    saved_state_snapshot: Dict[str, Any] = {}
 
 # --- Endpoints ---
 @app.on_event("startup")

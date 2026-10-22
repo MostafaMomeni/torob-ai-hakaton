@@ -6,14 +6,28 @@ import json
 from datetime import datetime, timedelta
 
 DATA_DIR = Path(__file__).parent / "data"
+# Also look next to the package (project root) so CSVs dropped alongside
+# the Python modules are found without a mandatory data/ subfolder.
+_ROOT_DIR = Path(__file__).parent
+
+
+def _resolve_csv(name: str, data_dir: Path) -> Path:
+    """Prefer data_dir/name, then project-root/name."""
+    primary = data_dir / name
+    if primary.exists():
+        return primary
+    fallback = _ROOT_DIR / name
+    if fallback.exists():
+        return fallback
+    return primary  # default path (may not exist yet; loaders handle missing files)
 
 
 class DataRepository:
     def __init__(self, data_dir: Optional[Path] = None):
         self.data_dir = data_dir or DATA_DIR
-        self.shops_csv = self.data_dir / "shops.csv"
-        self.products_csv = self.data_dir / "products.csv"
-        self.offers_csv = self.data_dir / "offers.csv"
+        self.shops_csv = _resolve_csv("shops.csv", self.data_dir)
+        self.products_csv = _resolve_csv("products.csv", self.data_dir)
+        self.offers_csv = _resolve_csv("offers.csv", self.data_dir)
         self._shops: Dict[str, Shop] = {}
         self._products: Dict[str, Product] = {}
         self._offers: Dict[str, Offer] = {}
@@ -57,6 +71,12 @@ class DataRepository:
         return value
 
     def _load_shops(self):
+        if not self.shops_csv.exists():
+            import logging
+            logging.getLogger("shopping_assistant.repository").warning(
+                "shops.csv not found at %s", self.shops_csv
+            )
+            return
         with self.shops_csv.open("r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for r in reader:
@@ -65,15 +85,14 @@ class DataRepository:
                 if shop_id:
                     self._shop_details[shop_id] = details
                 try:
-                    # Pass only fields represented by ShopRaw. shops.csv also has
-                    # useful metadata columns that may not exist in the Pydantic schema;
-                    # those are retained separately in _shop_details above.
+                    # Pass known ShopRaw fields; extras live in _shop_details.
                     raw_fields = (
                         "shop_id", "name", "address", "lat", "lon",
                         "location_label", "category_names", "contacts",
+                        "instagram", "payment_options", "supports_fast_delivery",
                         "website_url", "weekly_hours",
                     )
-                    raw = ShopRaw(**{key: r.get(key) for key in raw_fields if key in r})
+                    raw = ShopRaw(**{key: r.get(key) for key in raw_fields})
                 except Exception as e:
                     # skip invalid row but log
                     # use logging instead of printing to avoid noisy console output
@@ -115,7 +134,13 @@ class DataRepository:
                 self._shops[shop.shop_id] = shop
 
     def _load_products(self):
-        with self.products_csv.open("r", encoding="utf-8") as f:
+        if not self.products_csv.exists():
+            import logging
+            logging.getLogger("shopping_assistant.repository").warning(
+                "products.csv not found at %s", self.products_csv
+            )
+            return
+        with self.products_csv.open("r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for r in reader:
                 try:
@@ -149,7 +174,13 @@ class DataRepository:
                 self._products[p.product_id] = p
 
     def _load_offers(self):
-        with self.offers_csv.open("r", encoding="utf-8") as f:
+        if not self.offers_csv.exists():
+            import logging
+            logging.getLogger("shopping_assistant.repository").warning(
+                "offers.csv not found at %s", self.offers_csv
+            )
+            return
+        with self.offers_csv.open("r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for r in reader:
                 try:
