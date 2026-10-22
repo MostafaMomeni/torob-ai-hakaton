@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from schemas import ShopRaw, ProductRaw, OfferRaw, Shop, Product, Offer
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -17,8 +17,15 @@ class DataRepository:
         self._shops: Dict[str, Shop] = {}
         self._products: Dict[str, Product] = {}
         self._offers: Dict[str, Offer] = {}
+        self._offers_by_product: Dict[str, List[Offer]] = {}
+        self._offers_by_shop: Dict[str, List[Offer]] = {}
 
     def load_all(self):
+        self._shops.clear()
+        self._products.clear()
+        self._offers.clear()
+        self._offers_by_product.clear()
+        self._offers_by_shop.clear()
         self._load_shops()
         self._load_products()
         self._load_offers()
@@ -124,6 +131,9 @@ class DataRepository:
                     data_observed_at=raw.last_price_changed_at
                 )
                 self._offers[offer.offer_id] = offer
+                self._offers_by_product.setdefault(offer.product_id, []).append(offer)
+                if offer.shop_id:
+                    self._offers_by_shop.setdefault(offer.shop_id, []).append(offer)
 
     # Query APIs
     def get_shop(self, shop_id: str) -> Optional[Shop]:
@@ -133,10 +143,10 @@ class DataRepository:
         return self._products.get(product_id)
 
     def get_offers_by_product(self, product_id: str) -> List[Offer]:
-        return [o for o in self._offers.values() if o.product_id == product_id]
+        return list(self._offers_by_product.get(product_id, []))
 
     def get_offers_by_shop(self, shop_id: str) -> List[Offer]:
-        return [o for o in self._offers.values() if o.shop_id == shop_id]
+        return list(self._offers_by_shop.get(shop_id, []))
 
     def validate_references(self) -> Dict[str, List[str]]:
         """Check for offers pointing to missing products or shops"""

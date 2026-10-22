@@ -10,89 +10,62 @@ SEARCH_SYSTEM = '''You are a JSON extractor. Given a Persian user instruction ab
 
 
 def _normalize_llm_search_output(parsed: Any) -> Dict[str, Any]:
-    """
-    Normalize common LLM output shapes into the project's SearchSpec dict shape.
-
-    The LLM may return a flat dict with keys like 'query', 'category', 'min_price', etc.
-    We map those into SearchSpec fields conservatively without allowing arbitrary extras.
-    """
+    """Accept both the project's nested SearchSpec shape and common flat LLM JSON."""
     if not isinstance(parsed, dict):
         return {}
+    # Native nested output must be preserved; the previous implementation discarded it.
+    if any(key in parsed for key in ("product", "price", "location", "search_options", "conversation")):
+        out = {k: parsed[k] for k in ("product", "price", "location", "search_options", "conversation") if k in parsed}
+        if "product" not in out:
+            out["product"] = {}
+        if "price" not in out:
+            out["price"] = {}
+        if "location" not in out:
+            out["location"] = {}
+        if "search_options" not in out:
+            out["search_options"] = {}
+        return out
 
-    out: Dict[str, Any] = {}
-    # product
     product = {}
-    # prefer explicit product.name/product_name/query
-    if parsed.get("query"):
-        product["name"] = parsed.get("query")
-    elif parsed.get("product_name"):
-        product["name"] = parsed.get("product_name")
-    if parsed.get("brand"):
-        product["brand"] = parsed.get("brand")
-    if parsed.get("model"):
-        product["model"] = parsed.get("model")
-    # attributes/features
+    name = parsed.get("query") or parsed.get("product_name") or parsed.get("name")
+    if name:
+        product["name"] = name
+    for key in ("brand", "model", "keywords"):
+        if parsed.get(key) is not None:
+            product[key] = parsed[key]
     attrs = parsed.get("attributes") or parsed.get("features") or parsed.get("product_attributes")
     if isinstance(attrs, list):
-        # convert simple list of strings to FeatureSpec-like dicts
-        feats = []
-        for a in attrs:
-            if isinstance(a, str):
-                feats.append({"name": a, "operator": "eq", "value": True})
-            elif isinstance(a, dict) and a.get("name"):
-                feats.append(a)
-        if feats:
-            product["features"] = feats
-
-    # keywords
-    if parsed.get("keywords") and isinstance(parsed.get("keywords"), list):
-        product["keywords"] = parsed.get("keywords")
-
-    out["product"] = product
-
-    # price
+        product["features"] = [
+            {"name": a, "operator": "eq", "value": True} if isinstance(a, str)
+            else a for a in attrs if isinstance(a, str) or (isinstance(a, dict) and a.get("name"))
+        ]
     price = {}
     if parsed.get("min_price") is not None:
-        price["min"] = parsed.get("min_price")
+        price["min"] = parsed["min_price"]
     if parsed.get("max_price") is not None:
-        price["max"] = parsed.get("max_price")
+        price["max"] = parsed["max_price"]
     if parsed.get("currency"):
-        price["currency"] = parsed.get("currency")
-    if price:
-        out["price"] = price
-
-    # location
-    loc = {}
-    if parsed.get("location") and isinstance(parsed.get("location"), dict):
-        loc_mapping = parsed.get("location")
-        loc["city"] = loc_mapping.get("text")
-        loc["latitude"] = loc_mapping.get("latitude")
-        loc["longitude"] = loc_mapping.get("longitude")
-        loc["radius_km"] = loc_mapping.get("radius_km")
-    elif parsed.get("location") and isinstance(parsed.get("location"), str):
-        loc["city"] = parsed.get("location")
-    if loc:
-        out["location"] = loc
-
-    # search options: sort_by, limit
-    search_options = {}
+        price["currency"] = parsed["currency"]
+    raw_location = parsed.get("location")
+    location = {}
+    if isinstance(raw_location, dict):
+        location = {"city": raw_location.get("city") or raw_location.get("text"),
+                    "latitude": raw_location.get("latitude"), "longitude": raw_location.get("longitude"),
+                    "radius_km": raw_location.get("radius_km")}
+        location = {k: v for k, v in location.items() if v is not None}
+    elif isinstance(raw_location, str) and raw_location.strip():
+        location["city"] = raw_location.strip()
+    options = {}
     if parsed.get("sort_by"):
-        search_options["sort_by"] = parsed.get("sort_by")
+        options["sort_by"] = parsed["sort_by"]
     if parsed.get("limit") is not None:
         try:
-            search_options["limit"] = int(parsed.get("limit"))
-        except Exception:
+            options["limit"] = max(1, int(parsed["limit"]))
+        except (TypeError, ValueError):
             pass
-    if search_options:
-        out["search_options"] = search_options
-
-    # conversation / context - keep minimal
-    conv = {}
+    out = {"product": product, "price": price, "location": location, "search_options": options}
     if parsed.get("conversation_id"):
-        conv["session_id"] = parsed.get("conversation_id")
-    if conv:
-        out["conversation"] = conv
-
+        out["conversation"] = {"session_id": parsed["conversation_id"]}
     return out
 
 

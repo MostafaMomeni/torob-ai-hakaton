@@ -134,22 +134,8 @@ class Orchestrator:
         # if user says "همین مدل" -> use selected product ids from state
         if re.search(r"همین مدل|همین", text) and state.selected_product_ids:
             entities["refer_product_ids"] = state.selected_product_ids
-        # naive product token: words that look like product names (brand/model)
-        # check against repository products (will ensure loaded)
-        # create a set of lowercase searchable strings
-        self._ensure_loaded()
-        tokens = [t.strip() for t in re.split(r"[\s،,]+", text) if t.strip()]
-        matches = []
-        for p in self.repo._products.values():
-            hay = " ".join(
-                filter(None, [p.persian_title or "", p.brand_name or "", p.model or ""])
-            ).lower()
-            for tok in tokens:
-                if tok and tok in hay:
-                    matches.append(p.product_id)
-                    break
-        if matches:
-            entities["product_ids"] = list(dict.fromkeys(matches))
+        # Do not resolve arbitrary query tokens to product_ids here.
+        # That shortcut bypassed relevance ranking and made the first substring match win.
         # check for explicit product id mention like #p123
         m_id = re.search(r"product_id[:#]\s*(\w+)", text)
         if m_id:
@@ -536,6 +522,10 @@ class Orchestrator:
 
         # Prefer LLM-backed NLU analyzer if available; fall back to simple regex-based methods
         nlu = None
+        # Keep the independently extracted SearchSpec available to the search stage.
+        # NLUResult may not have a search_spec field, so do not rely on attaching it there.
+        search_spec = None
+        structured_search_attempted = False
         # Use instance-level analyzer so tests can inject a mock via orch.analyze_request
         if getattr(self, "analyze_request", None):
             try:
@@ -620,9 +610,8 @@ class Orchestrator:
                             # Skipping extract_search_spec when running with a SeqNLUMock-style analyzer
                             logger.debug("Skipping extract_search_spec because analyzer is a mock with _responses")
                         else:
-                            spec = extractor(text, context=ctx)
-                            # Do not try to set unknown attributes on Pydantic models (NLUResult forbids extras).
-                            # Keep spec in a local variable for downstream use.
+                            search_spec = extractor(text, context=ctx)
+                            # Keep the extracted SearchSpec in a dedicated variable for downstream use.
                             logger.info("SearchSpec extracted from LLM")
                             # Log a concise snippet of spec for debugging (env LLM_LOG_FULL to show full)
                             try:
@@ -631,17 +620,17 @@ class Orchestrator:
                                 show_full = False
                             try:
                                 if show_full:
-                                    logger.debug("SearchSpec (full): %s", getattr(spec, 'dict', lambda: spec)())
+                                    logger.debug("SearchSpec (full): %s", getattr(search_spec, 'dict', lambda: search_spec)())
                                 else:
                                     # show compact keys and a couple values
                                     spec_preview = {}
-                                    if hasattr(spec, 'dict'):
-                                        sd = spec.dict()
+                                    if hasattr(search_spec, 'dict'):
+                                        sd = search_spec.dict()
                                         spec_preview['product_name'] = sd.get('product', {}).get('name')
                                         spec_preview['price_max'] = sd.get('price', {}).get('max')
                                         spec_preview['location'] = sd.get('location', {}).get('city')
                                     else:
-                                        spec_preview = {k: (spec.get(k) if isinstance(spec, dict) else None) for k in ['product', 'price', 'location']}
+                                        spec_preview = {k: (search_spec.get(k) if isinstance(search_spec, dict) else None) for k in ['product', 'price', 'location']}
                                     logger.debug("SearchSpec preview: %s", spec_preview)
                             except Exception:
                                 logger.exception("Failed to log SearchSpec preview")
@@ -711,29 +700,35 @@ class Orchestrator:
             except Exception as e:
                 logger.warning("Failed to apply NLU to state: %s", e)
 
-            # If the LLM provided a high-quality SearchSpec, prefer running a structured search
+            # Prefer the SearchSpec extracted above. NLUResult generally does not
+            # contain a search_spec attribute, and re-extracting only via self would
+            # lose the module-level extractor result.
             try:
-                spec = getattr(nlu, "search_spec", None)
-                if spec is None and getattr(self, "extract_search_spec", None):
-                    # fallback: run extractor now
-                    try:
-                        spec = self.extract_search_spec(text, context=ctx)
-                    except Exception:
-                        spec = None
+                spec = getattr(nlu, "search_spec", None) or search_spec
                 if spec:
                     spec_dict = spec.dict() if hasattr(spec, "dict") else spec
-                    # run a structured search using our product_search component
                     try:
                         from product_search import run_structured_search
 
-                        ss_results = run_structured_search(self.repo, spec_dict, limit=state.active_filters.get('limit', 20) or 20)
+                        # A valid structured search owns both retrieval and hard filters.
+                        # If it returns zero results, do not fall back to a price-only
+                        # search that can return unrelated products.
+                        ss_results = run_structured_search(
+                            self.repo,
+                            spec_dict,
+                            limit=state.active_filters.get("limit", 20) or 20,
+                        )
+                        structured_search_attempted = True
+                        response_products = ss_results
                         if ss_results:
-                            response_products = ss_results
-                            reasons["note"] = "نتایج بر اساس مشخصات ساختاریافته LLM بازگشتی."
+                            reasons["note"] = "نتایج بر اساس نام محصول و فیلترهای ساختاریافته بازگشتی."
+                        else:
+                            reasons["note"] = "محصولی با نام و فیلترهای درخواستی پیدا نشد."
                     except Exception as e:
                         logger.warning("structured_search failed: %s", e)
-            except Exception:
-                pass
+                        structured_search_attempted = False
+            except Exception as e:
+                logger.warning("Could not prepare structured search: %s", e)
         else:
             # Intent detection removed — treat free-text as a product search query
             entities = self._extract_entities(text, state)
@@ -755,8 +750,9 @@ class Orchestrator:
         status = "success"
         next_q = None
 
-        # If the structured LLM search already produced results, skip local fallback searches.
-        if not response_products:
+        # Do not replace a valid structured search with a broad price-only fallback
+        # when the structured search correctly found no matching products.
+        if not response_products and not structured_search_attempted:
             response_products = []
             reasons = {}
             try:
