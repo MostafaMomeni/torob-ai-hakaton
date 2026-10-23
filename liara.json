@@ -1,5 +1,5 @@
 {
-  "app": "torob-ai-api",
+  "app": "torob-ai-api ",
   "port": 8000,
   "team-id": "6acdfb0326c5e4ecdb652e65",
   "build": {
